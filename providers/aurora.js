@@ -21,8 +21,7 @@ var CDN_RULES = [
 
 var UA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Mobile Safari/537.36";
 var TMDB_API_KEY = "83d364331c40bfbe29858aeed82f45cc";
-var FETCH_TIMEOUT_MS = 8000;
-var HLS_TIMEOUT_MS = 5000;
+var FETCH_TIMEOUT_MS = 12000;
 
 function log(m) { console.log("[" + PROVIDER_NAME + "] " + m); }
 
@@ -209,11 +208,7 @@ function parseMaster(masterUrl, text) {
       byKey[key] = { label: label, bandwidth: b, url: absUrl(masterUrl, uri) };
     }
   }
-  return {
-    variants: Object.keys(byKey).map(function(k) { return byKey[k]; }),
-    best: best,
-    hasSeparateAudio: hasSeparateAudio
-  };
+  return { variants: Object.keys(byKey).map(function(k) { return byKey[k]; }), best: best, hasSeparateAudio: hasSeparateAudio };
 }
 
 function makeStream(ctx, url, label, rank, headers, subtitles) {
@@ -230,14 +225,13 @@ function makeStream(ctx, url, label, rank, headers, subtitles) {
     headers: h,
     subtitles: subtitles || [],
     provider: PROVIDER_ID,
-    _rank: rank,
-    _sourceName: ctx.sourceName
+    _rank: rank
   };
 }
 
 function tryCandidate(url, c) {
   var hdrs = headersOf(c);
-  return request(url, hdrs, HLS_TIMEOUT_MS).then(function(r) {
+  return request(url, hdrs).then(function(r) {
     if (r.ok && r.text.indexOf("#EXTM3U") !== -1) return { r: r, cand: c };
     return null;
   }, function() { return null; });
@@ -263,19 +257,15 @@ function firstValid(tasks) {
 function expandSource(url, ctx) {
   var cands = buildCands(url);
   return firstValid(cands.map(function(c) { return tryCandidate(url, c); })).then(function(x) {
-    if (!x) {
-      return [makeStream(ctx, url, "Auto", 1000000, headersOf(cands[0]), ctx.subtitles)];
-    }
+    if (!x) return [makeStream(ctx, url, "Auto", 1000000, headersOf(cands[0]), ctx.subtitles)];
     var r = x.r;
     var hdr = headersOf(x.cand);
     var finalUrl = /^https?:\/\//i.test(r.url || "") ? r.url : url;
     var master = parseMaster(finalUrl, r.text);
     var top = labelFromRes(master.best.w, master.best.h);
-
     if (master.variants.length < 2 || master.hasSeparateAudio) {
       return [makeStream(ctx, finalUrl, top, 1000000, hdr, ctx.subtitles)];
     }
-
     var out = [makeStream(ctx, finalUrl, "Auto", 1000000, hdr, ctx.subtitles)];
     master.variants.forEach(function(v) {
       out.push(makeStream(ctx, v.url, v.label, rankOf(v.label), hdr, ctx.subtitles));
@@ -298,14 +288,6 @@ function fetchMeta(tmdbId, type) {
   });
 }
 
-function applyMeta(ctx, meta, type, season, episode) {
-  if (meta && meta.title) {
-    ctx.displayTitle = type === "movie"
-      ? meta.title + (meta.year ? " (" + meta.year + ")" : "")
-      : meta.title + " S" + pad2(season) + "E" + pad2(episode);
-  }
-}
-
 function apiHeaders() {
   return {
     "User-Agent": UA,
@@ -321,8 +303,6 @@ function callApi(source, tmdbId, type, season, episode) {
     ? "movie/" + encodeURIComponent(tmdbId)
     : "tv/" + encodeURIComponent(tmdbId) + "/" + season + "/" + episode;
   var url = API_BASE + "/" + path + "?source=" + encodeURIComponent(source);
-  log("API (" + source + "): " + url);
-
   return request(url, apiHeaders()).then(function(r) {
     var data = null;
     try { data = JSON.parse(r.text); } catch (e) { }
@@ -333,76 +313,53 @@ function callApi(source, tmdbId, type, season, episode) {
 
 function sourceStreams(sourceName, tmdbId, type, season, episode, baseDisplayTitle) {
   return callApi(sourceName, tmdbId, type, season, episode).then(function(data) {
-    if (!data) {
-      log(sourceName + ": no response");
-      return [];
-    }
+    if (!data) { log(sourceName + ": no response"); return []; }
     var found = [];
     walkMedia(data, found, 0, "");
     found = unique(found);
-    found.sort(function(a, b) {
-      return (/\.m3u8/i.test(b) ? 1 : 0) - (/\.m3u8/i.test(a) ? 1 : 0);
-    });
-    if (!found.length) {
-      log(sourceName + ": no media url");
-      return [];
-    }
+    found.sort(function(a, b) { return (/\.m3u8/i.test(b) ? 1 : 0) - (/\.m3u8/i.test(a) ? 1 : 0); });
+    if (!found.length) { log(sourceName + ": no media url"); return []; }
     var subs = [];
     walkSubs(data, subs, 0, false);
-    var ctx = {
-      displayTitle: baseDisplayTitle,
-      subtitles: unique(subs),
-      sourceName: sourceName
-    };
+    var ctx = { displayTitle: baseDisplayTitle, subtitles: unique(subs), sourceName: sourceName };
     log(sourceName + ": " + found.length + " url(s) found");
     return Promise.all(found.map(function(u) { return expandSource(u, ctx); })).then(function(groups) {
       var out = [];
       groups.forEach(function(g) { g.forEach(function(s) { out.push(s); }); });
       return out;
     });
-  }).catch(function(e) {
-    log(sourceName + " failed: " + (e && e.message));
-    return [];
-  });
+  }).catch(function(e) { log(sourceName + " failed: " + (e && e.message)); return []; });
 }
 
 function getStreamsFor(tmdbId, type, season, episode) {
-  var baseDisplayTitle = type === "movie"
-    ? "TMDB " + tmdbId
-    : "TMDB " + tmdbId + " S" + pad2(season) + "E" + pad2(episode);
-
   var metaP = fetchMeta(tmdbId, type).catch(function() { return null; });
-
-  var sourceTasks = SOURCES.map(function(src) {
-    return sourceStreams(src, tmdbId, type, season, episode, baseDisplayTitle);
-  });
-
-  return Promise.all([metaP, Promise.all(sourceTasks)]).then(function(results) {
-    var meta = results[0];
-    var groups = results[1];
-
-    var displayTitle = baseDisplayTitle;
+  return metaP.then(function(meta) {
+    var baseDisplayTitle = type === "movie"
+      ? "TMDB " + tmdbId
+      : "TMDB " + tmdbId + " S" + pad2(season) + "E" + pad2(episode);
     if (meta && meta.title) {
-      displayTitle = type === "movie"
+      baseDisplayTitle = type === "movie"
         ? meta.title + (meta.year ? " (" + meta.year + ")" : "")
         : meta.title + " S" + pad2(season) + "E" + pad2(episode);
     }
-
-    var seen = {};
-    var out = [];
-    groups.forEach(function(g) {
-      g.forEach(function(s) {
-        if (seen[s.url]) return;
-        seen[s.url] = true;
-        s.title = displayTitle + " \u2022 " + s.quality + " \u2022 " + s._sourceName;
-        delete s._sourceName;
-        out.push(s);
-      });
+    var tasks = SOURCES.map(function(src) {
+      return sourceStreams(src, tmdbId, type, season, episode, baseDisplayTitle);
     });
-    out.sort(function(a, b) { return b._rank - a._rank; });
-    out.forEach(function(s) { delete s._rank; });
-    log("Returned " + out.length + " total stream(s)");
-    return out;
+    return Promise.all(tasks).then(function(groups) {
+      var seen = {};
+      var out = [];
+      groups.forEach(function(g) {
+        g.forEach(function(s) {
+          if (seen[s.url]) return;
+          seen[s.url] = true;
+          out.push(s);
+        });
+      });
+      out.sort(function(a, b) { return b._rank - a._rank; });
+      out.forEach(function(s) { delete s._rank; });
+      log("Returned " + out.length + " total stream(s)");
+      return out;
+    });
   }).catch(function(err) {
     log("FAILED: " + (err && err.message));
     return [];
@@ -414,9 +371,7 @@ function getStreams(tmdbId, mediaType, seasonNum, episodeNum) {
   var season = parseInt(seasonNum, 10) || 1;
   var episode = parseInt(episodeNum, 10) || 1;
   log("getStreams: " + tmdbId + " " + type + (type === "tv" ? " S" + season + "E" + episode : ""));
-
   if (!tmdbId) return Promise.resolve([]);
-
   return getStreamsFor(String(tmdbId), type, season, episode).catch(function(err) {
     log("error: " + (err && err.message));
     return [];
