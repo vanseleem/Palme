@@ -3,13 +3,13 @@
   "version": "1.0.0",
   "scrapers": [
     {
-      "id": "saturn",
-      "name": "🪐 Saturn",
+      "id": "aurora",
+      "name": "☄️ Aurora",
       "description": "Movies and TV series via VidFlix (scrapify CDN, netoda.tech)",
       "version": "1.0.0",
       "author": "vanseleem",
       "supportedTypes": ["movie", "tv"],
-      "filename": "providers/saturn.js",
+      "filename": "providers/aurora.js",
       "enabled": true,
       "hasSettings": false,
       "formats": ["m3u8"],
