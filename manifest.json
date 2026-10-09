@@ -3,6 +3,21 @@
   "version": "1.0.0",
   "scrapers": [
     {
+      "id": "saturn",
+      "name": "🪐 Saturn",
+      "description": "Movies and TV series via VidFlix (scrapify CDN, netoda.tech)",
+      "version": "1.0.0",
+      "author": "vanseleem",
+      "supportedTypes": ["movie", "tv"],
+      "filename": "providers/vidflix.js",
+      "enabled": true,
+      "hasSettings": false,
+      "formats": ["m3u8"],
+      "contentLanguage": ["en"],
+      "limited": false,
+      "supportsExternalPlayer": true
+    },
+    {
       "id": "nebula",
       "name": "🌀 Nebula",
       "description": "Movies and TV series via Vortex backend",
