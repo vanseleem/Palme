@@ -1,3 +1,4 @@
+"use strict";
 
 var USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36";
 var HELIOS_API = "https://justice.hls.lol";
@@ -26,7 +27,7 @@ function decryptHeliosUrl(encryptedUrl) {
     var iv = encryptedBytes.slice(0, 12);
     var ciphertext = encryptedBytes.slice(12);
     if (typeof crypto === "undefined" || !crypto.subtle) {
-      console.warn("[Atlantic] crypto.subtle unavailable.");
+      console.warn("[Atlantic] crypto.subtle unavailable, returning encrypted URL.");
       resolve(encryptedUrl);
       return;
     }
@@ -81,7 +82,7 @@ function fetchHelios(tmdbId, mediaType, season, episode) {
   });
 }
 
-function parseM3u8Variants(masterUrl) {
+function fetchM3u8Quality(m3u8Url) {
   return new Promise(function(resolve) {
     var fetchOptions = {
       headers: {
@@ -92,52 +93,30 @@ function parseM3u8Variants(masterUrl) {
     if (typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function") {
       fetchOptions.signal = AbortSignal.timeout(5000);
     }
-    fetch(masterUrl, fetchOptions)
+    fetch(m3u8Url, fetchOptions)
       .then(function(response) {
         if (!response.ok) throw new Error("HTTP " + response.status);
         return response.text();
       })
       .then(function(text) {
-        var variants = [];
-        var lines = text.split("\n");
-        var baseUrl = masterUrl.substring(0, masterUrl.lastIndexOf("/") + 1);
-
-        for (var i = 0; i < lines.length; i++) {
-          var line = lines[i].trim();
-          if (line.indexOf("#EXT-X-STREAM-INF") === 0) {
-            var resMatch = line.match(/RESOLUTION=(\d+)x(\d+)/);
-            var height = resMatch ? parseInt(resMatch[2]) : 0;
-            var quality = height > 0 ? height + "p" : "Auto";
-
-            var variantUrl = "";
-            for (var j = i + 1; j < lines.length; j++) {
-              var next = lines[j].trim();
-              if (next && next.indexOf("#") !== 0) {
-                variantUrl = next;
-                i = j;
-                break;
-              }
-            }
-
-            if (variantUrl) {
-              if (variantUrl.indexOf("http") !== 0) {
-                variantUrl = baseUrl + variantUrl;
-              }
-              variants.push({ url: variantUrl, quality: quality, height: height });
-            }
+        // Find highest RESOLUTION= in master playlist
+        var matches = text.match(/RESOLUTION=(\d+)x(\d+)/g);
+        if (!matches || matches.length === 0) {
+          resolve("Auto");
+          return;
+        }
+        var highest = 0;
+        matches.forEach(function(m) {
+          var parts = m.match(/RESOLUTION=(\d+)x(\d+)/);
+          if (parts) {
+            var h = parseInt(parts[2]);
+            if (h > highest) highest = h;
           }
-        }
-
-        variants.sort(function(a, b) { return b.height - a.height; });
-
-        if (variants.length === 0) {
-          resolve([{ url: masterUrl, quality: "Auto", height: 0 }]);
-        } else {
-          resolve(variants);
-        }
+        });
+        resolve(highest > 0 ? highest + "p" : "Auto");
       })
       .catch(function() {
-        resolve([{ url: masterUrl, quality: "Auto", height: 0 }]);
+        resolve("Auto");
       });
   });
 }
@@ -156,7 +135,7 @@ function makeStream(url, server, quality) {
 }
 
 function getStreams(tmdbId, mediaType, season, episode) {
-  return new Promise(function(resolve) {
+  return new Promise(function(resolve, reject) {
     console.log("[Atlantic] Request:", tmdbId, mediaType, season, episode);
     if (!tmdbId || (mediaType !== "movie" && mediaType !== "tv")) {
       resolve([]);
@@ -166,57 +145,37 @@ function getStreams(tmdbId, mediaType, season, episode) {
       resolve([]);
       return;
     }
-
     fetchHelios(tmdbId, mediaType, season, episode)
       .then(function(sources) {
         var keys = Object.keys(sources);
         if (keys.length === 0) {
           console.log("[Atlantic] No sources found.");
-          resolve([]);
-          return;
+          return [];
         }
-
         var serverOrder = ["Moscow", "Novo", "Omsk"];
-        var seenMasterUrls = {};
-        var seenVariantUrls = {};
-
-        var serverPromises = serverOrder.map(function(serverName) {
+        var seen = {};
+        var streamPromises = serverOrder.map(function(serverName) {
           var source = sources[serverName];
-          if (!source || !source.url) return Promise.resolve([]);
-
+          if (!source || !source.url) return Promise.resolve(null);
           return decryptHeliosUrl(source.url)
-            .then(function(masterUrl) {
-              if (seenMasterUrls[masterUrl]) {
-                console.log("[Atlantic] Skipping duplicate master for " + serverName);
-                return [];
-              }
-              seenMasterUrls[masterUrl] = true;
-
-              return parseM3u8Variants(masterUrl)
-                .then(function(variants) {
-                  var streams = [];
-                  variants.forEach(function(v) {
-                    if (seenVariantUrls[v.url]) return;
-                    seenVariantUrls[v.url] = true;
-                    streams.push(makeStream(v.url, serverName, v.quality));
-                    console.log("[Atlantic] " + serverName + " • " + v.quality + ": " + v.url.substring(0, 60));
-                  });
-                  return streams;
+            .then(function(m3u8Url) {
+              if (seen[m3u8Url]) return null;
+              seen[m3u8Url] = true;
+              return fetchM3u8Quality(m3u8Url)
+                .then(function(quality) {
+                  console.log("[Atlantic] " + serverName + " quality: " + quality);
+                  return makeStream(m3u8Url, serverName, quality);
                 });
             })
             .catch(function(err) {
               console.error("[Atlantic] Failed to process " + serverName + ":", err.message);
-              return [];
+              return null;
             });
         });
-
-        return Promise.all(serverPromises);
+        return Promise.all(streamPromises);
       })
       .then(function(results) {
-        var streams = [];
-        (results || []).forEach(function(arr) {
-          (arr || []).forEach(function(s) { streams.push(s); });
-        });
+        var streams = (results || []).filter(function(s) { return s !== null; });
         console.log("[Atlantic] Total streams:", streams.length);
         resolve(streams);
       })
