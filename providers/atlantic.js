@@ -1,15 +1,4 @@
-"use strict";
 
-/**
- * Atlantic.st Provider for Nuvio
- * 
- * Works like the other providers (akwam, alooty, etc.)
- * Direct API + AES-GCM decryption
- * No external dependencies
- * 
- * Verified: September 28, 2026
- * Algorithm: 100% Confirmed
- */
 
 var __async = (__this, __arguments, generator) => {
   return new Promise((resolve, reject) => {
