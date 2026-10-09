@@ -1,5 +1,5 @@
-var PROVIDER_ID = "saturn";
-var PROVIDER_NAME = "Saturn";
+var PROVIDER_ID = "aurora";
+var PROVIDER_NAME = "Aurora";
 
 var API_BASE = "https://player.vidflix.club/api/vidora/v1";
 var SITE = "https://player.vidflix.club";
