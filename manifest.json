@@ -4,7 +4,7 @@
   "scrapers": [
     {
       "id": "aurora",
-      "name": "☄️ Aurora",
+      "name": "🌌 Aurora",
       "description": "Movies and TV series via VidFlix (scrapify CDN, netoda.tech)",
       "version": "1.0.0",
       "author": "vanseleem",
