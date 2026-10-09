@@ -21,7 +21,9 @@ var CDN_RULES = [
 
 var UA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Mobile Safari/537.36";
 var TMDB_API_KEY = "83d364331c40bfbe29858aeed82f45cc";
-var FETCH_TIMEOUT_MS = 12000;
+var FETCH_TIMEOUT_MS = 6000;
+var HLS_TIMEOUT_MS = 5000;
+var OVERALL_BUDGET_MS = 7000;
 
 function log(m) { console.log("[" + PROVIDER_NAME + "] " + m); }
 
@@ -231,7 +233,7 @@ function makeStream(ctx, url, label, rank, headers, subtitles) {
 
 function tryCandidate(url, c) {
   var hdrs = headersOf(c);
-  return request(url, hdrs).then(function(r) {
+  return request(url, hdrs, HLS_TIMEOUT_MS).then(function(r) {
     if (r.ok && r.text.indexOf("#EXTM3U") !== -1) return { r: r, cand: c };
     return null;
   }, function() { return null; });
@@ -279,7 +281,7 @@ function expandSource(url, ctx) {
 function fetchMeta(tmdbId, type) {
   var url = "https://api.themoviedb.org/3/" + type + "/" + encodeURIComponent(tmdbId) +
     "?api_key=" + TMDB_API_KEY + "&language=en";
-  return request(url, { "Accept": "application/json" }).then(function(r) {
+  return request(url, { "Accept": "application/json" }, 4000).then(function(r) {
     if (!r.ok) throw new Error("HTTP " + r.status);
     var d = JSON.parse(r.text);
     var title = type === "movie" ? (d.title || d.original_title) : (d.name || d.original_name);
@@ -303,7 +305,7 @@ function callApi(source, tmdbId, type, season, episode) {
     ? "movie/" + encodeURIComponent(tmdbId)
     : "tv/" + encodeURIComponent(tmdbId) + "/" + season + "/" + episode;
   var url = API_BASE + "/" + path + "?source=" + encodeURIComponent(source);
-  return request(url, apiHeaders()).then(function(r) {
+  return request(url, apiHeaders(), FETCH_TIMEOUT_MS).then(function(r) {
     var data = null;
     try { data = JSON.parse(r.text); } catch (e) { }
     if (!r.ok || !data || data.result === false) return null;
@@ -331,35 +333,59 @@ function sourceStreams(sourceName, tmdbId, type, season, episode, baseDisplayTit
   }).catch(function(e) { log(sourceName + " failed: " + (e && e.message)); return []; });
 }
 
+function rollingCollect(promises, maxMs) {
+  return new Promise(function(resolve) {
+    var out = [];
+    var pending = promises.length;
+    var done = false;
+    var timer = setTimeout(function() {
+      if (!done) { done = true; log("budget hit — returning partial results"); resolve(out); }
+    }, maxMs);
+    if (!pending) { clearTimeout(timer); return resolve([]); }
+    promises.forEach(function(p) {
+      p.then(function(v) {
+        if (Array.isArray(v)) { v.forEach(function(s) { out.push(s); }); }
+        pending--;
+        if (pending === 0 && !done) { done = true; clearTimeout(timer); resolve(out); }
+      }, function() {
+        pending--;
+        if (pending === 0 && !done) { done = true; clearTimeout(timer); resolve(out); }
+      });
+    });
+  });
+}
+
 function getStreamsFor(tmdbId, type, season, episode) {
-  var metaP = fetchMeta(tmdbId, type).catch(function() { return null; });
-  return metaP.then(function(meta) {
-    var baseDisplayTitle = type === "movie"
-      ? "TMDB " + tmdbId
-      : "TMDB " + tmdbId + " S" + pad2(season) + "E" + pad2(episode);
+  var baseDisplayTitle = type === "movie"
+    ? "TMDB " + tmdbId
+    : "TMDB " + tmdbId + " S" + pad2(season) + "E" + pad2(episode);
+
+  var metaP = fetchMeta(tmdbId, type).then(function(meta) {
     if (meta && meta.title) {
-      baseDisplayTitle = type === "movie"
+      var t = type === "movie"
         ? meta.title + (meta.year ? " (" + meta.year + ")" : "")
         : meta.title + " S" + pad2(season) + "E" + pad2(episode);
+      metaP.resolvedTitle = t;
     }
-    var tasks = SOURCES.map(function(src) {
-      return sourceStreams(src, tmdbId, type, season, episode, baseDisplayTitle);
+    return meta;
+  }).catch(function() { return null; });
+
+  var tasks = SOURCES.map(function(src) {
+    return sourceStreams(src, tmdbId, type, season, episode, baseDisplayTitle);
+  });
+
+  return rollingCollect(tasks, OVERALL_BUDGET_MS).then(function(streams) {
+    var seen = {};
+    var out = [];
+    streams.forEach(function(s) {
+      if (seen[s.url]) return;
+      seen[s.url] = true;
+      out.push(s);
     });
-    return Promise.all(tasks).then(function(groups) {
-      var seen = {};
-      var out = [];
-      groups.forEach(function(g) {
-        g.forEach(function(s) {
-          if (seen[s.url]) return;
-          seen[s.url] = true;
-          out.push(s);
-        });
-      });
-      out.sort(function(a, b) { return b._rank - a._rank; });
-      out.forEach(function(s) { delete s._rank; });
-      log("Returned " + out.length + " total stream(s)");
-      return out;
-    });
+    out.sort(function(a, b) { return b._rank - a._rank; });
+    out.forEach(function(s) { delete s._rank; });
+    log("Returned " + out.length + " total stream(s)");
+    return out;
   }).catch(function(err) {
     log("FAILED: " + (err && err.message));
     return [];
