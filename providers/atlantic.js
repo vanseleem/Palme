@@ -5,15 +5,22 @@ var USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (
 var HELIOS_BASE = "https://stream.hls.lol";
 var AES_GCM_KEY_HEX = "117c358bcfcaf8fe2cfca57c9d2238a300e1c4de2efb83a5012ba84d8a31f1dd";
 
-// Per-server endpoints — each returns its own {sources: {...}}
-var ENDPOINTS = ["moscow", "planets", "saturn", "nova", "omsk"];
+// Endpoints from the DevTools Network capture:
+//   moscow → sources.Moscow (ms_)
+//   planets → sources.Saturn (pl_)
+//   pandora → dash (pd_)
+// (cdn, media, subs are metadata endpoints — not used for stream URLs)
+var ENDPOINTS = ["moscow", "planets", "pandora"];
 
 function log(m) { console.log("[Atlantic] " + m); }
 
 function hexToBytes(hex) {
+  // Trim to even length (some payloads include a trailing extra char)
+  if (hex.length % 2 !== 0) hex = hex.slice(0, hex.length - 1);
   var bytes = new Uint8Array(hex.length / 2);
   for (var i = 0; i < hex.length; i += 2) {
-    bytes[i / 2] = parseInt(hex.substr(i, 2), 16);
+    var b = parseInt(hex.substr(i, 2), 16);
+    bytes[i / 2] = isNaN(b) ? 0 : b;
   }
   return bytes;
 }
@@ -30,10 +37,14 @@ function decryptAtlanticUrl(encryptedUrl) {
       reject(new Error("Empty URL"));
       return;
     }
-    var m = /^([a-z]{2})_(.+)$/i.exec(encryptedUrl);
-    if (!m) { resolve(encryptedUrl); return; }
-
-    var hexPayload = m[2];
+    // Prefix is 2 lowercase letters + underscore: ms_, pl_, pd_, hl_, etc.
+    var idx = encryptedUrl.indexOf("_");
+    if (idx < 2 || idx > 3) {
+      // Not encrypted, return as-is
+      resolve(encryptedUrl);
+      return;
+    }
+    var hexPayload = encryptedUrl.slice(idx + 1);
     var encryptedBytes = hexToBytes(hexPayload);
     if (encryptedBytes.length < 29) {
       reject(new Error("Payload too short (" + encryptedBytes.length + " bytes)"));
@@ -54,7 +65,9 @@ function decryptAtlanticUrl(encryptedUrl) {
       .then(function(d) {
         resolve(utf8Decode(new Uint8Array(d)));
       })
-      .catch(function(err) { reject(err); });
+      .catch(function(err) {
+        reject(new Error("AES-GCM: " + (err && err.message)));
+      });
   });
 }
 
@@ -74,21 +87,29 @@ function fetchEndpoint(name, tmdbId, mediaType, season, episode) {
       pairs.push(["episodeId", String(episode || 1)]);
     }
     var url = HELIOS_BASE + "/" + name + "?" + buildQuery(pairs);
-    log("GET /" + name);
+    log("GET " + url);
 
+    // Minimal headers — no Referer/Origin (Nuvio fetch can't set those anyway)
     fetch(url, {
+      method: "GET",
       headers: {
         "User-Agent": USER_AGENT,
-        "Accept": "application/json",
-        "Referer": "https://atlantic.st/",
-        "Origin": "https://atlantic.st"
+        "Accept": "application/json, text/plain, */*"
       }
     })
       .then(function(r) {
+        log("/" + name + " HTTP " + r.status);
         if (!r.ok) throw new Error("HTTP " + r.status);
-        return r.json();
+        return r.text();
       })
-      .then(function(data) { resolve(data); })
+      .then(function(text) {
+        log("/" + name + " body length: " + text.length);
+        var parsed = null;
+        try { parsed = JSON.parse(text); } catch (e) {
+          log("/" + name + " not JSON: " + text.substring(0, 120));
+        }
+        resolve(parsed);
+      })
       .catch(function(e) {
         log("/" + name + " failed: " + (e && e.message));
         resolve(null);
@@ -103,9 +124,7 @@ function makeStream(url, serverName, quality) {
     url: url,
     quality: quality,
     headers: {
-      "User-Agent": USER_AGENT,
-      "Referer": "https://atlantic.st/",
-      "Origin": "https://atlantic.st"
+      "User-Agent": USER_AGENT
     },
     provider: PROVIDER_ID
   };
@@ -125,13 +144,13 @@ function getStreams(tmdbId, mediaType, season, episode) {
       var encrypted = [];
 
       results.forEach(function(resp, i) {
-        if (!resp) return;
+        if (!resp || typeof resp !== "object") return;
 
-        // Per-server response: {sources: {Moscow: {url: "ms_...", type: "hls"}}}
+        // Shape 1: {sources: {Moscow: {url: "ms_...", type: "hls", server: "Moscow"}}}
         if (resp.sources && typeof resp.sources === "object") {
           Object.keys(resp.sources).forEach(function(k) {
             var s = resp.sources[k];
-            if (s && s.url && typeof s.url === "string" && s.type !== "dash") {
+            if (s && typeof s.url === "string" && s.url.indexOf("_") !== -1) {
               encrypted.push({
                 url: s.url,
                 server: s.server || k,
@@ -141,9 +160,22 @@ function getStreams(tmdbId, mediaType, season, episode) {
           });
         }
 
-        // Top-level URL fallback
-        if (typeof resp.url === "string" && /^[a-z]{2}_/i.test(resp.url)) {
-          encrypted.push({ url: resp.url, server: ENDPOINTS[i], label: "AUTO" });
+        // Shape 2: {dash: "pd_..."}   (pandora response)
+        if (typeof resp.dash === "string" && resp.dash.indexOf("pd_") === 0) {
+          encrypted.push({
+            url: resp.dash,
+            server: "Pandora",
+            label: "DASH"
+          });
+        }
+
+        // Shape 3: {url: "ms_..."} top-level
+        if (typeof resp.url === "string" && /^[a-z]{2}_/.test(resp.url)) {
+          encrypted.push({
+            url: resp.url,
+            server: ENDPOINTS[i] || "Server",
+            label: "AUTO"
+          });
         }
       });
 
@@ -151,10 +183,10 @@ function getStreams(tmdbId, mediaType, season, episode) {
 
       var decPromises = encrypted.map(function(item) {
         return decryptAtlanticUrl(item.url).then(function(decrypted) {
-          log(item.server + " -> " + decrypted.substring(0, 80));
+          log(item.server + " decrypted OK (" + decrypted.length + " chars)");
           return { url: decrypted, server: item.server, label: item.label };
         }).catch(function(e) {
-          log(item.server + " decrypt failed: " + (e && e.message));
+          log(item.server + " decrypt FAILED: " + (e && e.message));
           return null;
         });
       });
