@@ -133,9 +133,7 @@ function buildCands(url, opts) {
     seen[k] = true;
     list.push(c);
   }
-  if (opts.customHeaders) {
-    add({ full: opts.customHeaders });
-  }
+  if (opts.customHeaders) add({ full: opts.customHeaders });
   if (opts.hint) add({ referer: opts.hint.referer || "", origin: opts.hint.origin || "" });
   var rule = ruleFor(url);
   if (rule) rule.referers.forEach(function(r) { add({ referer: r, origin: rule.origin || "" }); });
@@ -240,9 +238,10 @@ function parseMaster(masterUrl, text) {
 function makeStream(ctx, url, label, rank, headers, subtitles) {
   var h = {};
   Object.keys(headers).forEach(function(k) { h[k] = headers[k]; });
+  var tag = " \u2022 " + ctx.sourceName;
   return {
-    name: PROVIDER_NAME + " " + label,
-    title: ctx.displayTitle + " \u2022 " + label,
+    name: PROVIDER_NAME + " " + label + tag,
+    title: ctx.displayTitle + " \u2022 " + label + tag,
     url: url,
     quality: label,
     size: "Unknown",
@@ -279,11 +278,10 @@ function firstValid(tasks) {
   });
 }
 
-function expandSource(url, ctx, opts) {
-  var cands = buildCands(url, opts);
+function expandSource(url, ctx) {
+  var cands = buildCands(url, {});
   return firstValid(cands.map(function(c) { return tryCandidate(url, c); })).then(function(x) {
     if (!x) {
-      log("master fetch failed with all headers: " + url.split("?")[0]);
       return [makeStream(ctx, url, "Auto", 1000000, headersOf(cands[0]), ctx.subtitles)];
     }
     var r = x.r;
@@ -301,8 +299,7 @@ function expandSource(url, ctx, opts) {
       out.push(makeStream(ctx, v.url, v.label, rankOf(v.label), hdr, ctx.subtitles));
     });
     return out;
-  }).catch(function(e) {
-    log("expand failed: " + (e && e.message));
+  }).catch(function() {
     return [makeStream(ctx, url, "Auto", 1000000, headersOf(cands[0]), ctx.subtitles)];
   });
 }
@@ -315,11 +312,7 @@ function fetchMeta(tmdbId, type) {
     var d = JSON.parse(r.text);
     var title = type === "movie" ? (d.title || d.original_title) : (d.name || d.original_name);
     var date = type === "movie" ? d.release_date : d.first_air_date;
-    return {
-      title: title || "",
-      year: (date || "").slice(0, 4),
-      imdbId: (d.external_ids && d.external_ids.imdb_id) || d.imdb_id || ""
-    };
+    return { title: title || "", year: (date || "").slice(0, 4) };
   });
 }
 
@@ -346,22 +339,53 @@ function callApi(source, tmdbId, type, season, episode) {
     ? "movie/" + encodeURIComponent(tmdbId)
     : "tv/" + encodeURIComponent(tmdbId) + "/" + season + "/" + episode;
   var url = API_BASE + "/" + path + "?source=" + encodeURIComponent(source);
-  log("API (" + source + "): " + url);
 
   return request(url, apiHeaders()).then(function(r) {
     var data = null;
     try { data = JSON.parse(r.text); } catch (e) { }
-    if (!r.ok || !data || data.result === false) {
-      return null;
-    }
+    if (!r.ok || !data || data.result === false) return null;
     return data;
   }).catch(function() { return null; });
 }
 
-function vaplayerStage(ctx, type, season, episode) {
-  var url = VAPLAYER_API + "?tmdb=" + encodeURIComponent(ctx.tmdbId) + "&type=" + type;
+function sourceStreams(sourceName, tmdbId, type, season, episode, baseDisplayTitle) {
+  return callApi(sourceName, tmdbId, type, season, episode).then(function(data) {
+    if (!data) {
+      log(sourceName + ": no response");
+      return [];
+    }
+    var found = [];
+    walkMedia(data, found, 0, "");
+    found = unique(found);
+    found.sort(function(a, b) {
+      return (/\.m3u8/i.test(b) ? 1 : 0) - (/\.m3u8/i.test(a) ? 1 : 0);
+    });
+    if (!found.length) {
+      log(sourceName + ": no media url in reply");
+      return [];
+    }
+    var subs = [];
+    walkSubs(data, subs, 0, false);
+    var ctx = {
+      displayTitle: baseDisplayTitle,
+      subtitles: unique(subs),
+      sourceName: sourceName
+    };
+    log(sourceName + ": " + found.length + " url(s) found");
+    return Promise.all(found.map(function(u) { return expandSource(u, ctx); })).then(function(groups) {
+      var out = [];
+      groups.forEach(function(g) { g.forEach(function(s) { out.push(s); }); });
+      return out;
+    });
+  }).catch(function(e) {
+    log(sourceName + " failed: " + (e && e.message));
+    return [];
+  });
+}
+
+function vaplayerStreams(tmdbId, type, season, episode, baseDisplayTitle) {
+  var url = VAPLAYER_API + "?tmdb=" + encodeURIComponent(tmdbId) + "&type=" + type;
   if (type === "tv") url += "&season=" + season + "&episode=" + episode;
-  log("vaplayer fallback: " + url);
 
   return request(url, VAPLAYER_HEADERS).then(function(r) {
     var data = null;
@@ -370,28 +394,22 @@ function vaplayerStage(ctx, type, season, episode) {
       log("vaplayer: nothing");
       return [];
     }
-
     var label = labelFromName(data.data.file_name);
     var subs = [];
     if (Array.isArray(data.default_subs)) {
       data.default_subs.forEach(function(s) {
         if (!s || typeof s.url !== "string") return;
         var lang = s.lang || s.code || "";
-        subs.push({
-          url: s.url,
-          language: String(lang).toLowerCase().slice(0, 12) || "und",
-          name: String(lang || "Subtitle")
-        });
+        subs.push({ url: s.url, language: String(lang).toLowerCase().slice(0, 12) || "und", name: String(lang || "Subtitle") });
       });
     }
-    ctx.subtitles = subs;
-
+    var ctx = { displayTitle: baseDisplayTitle, subtitles: subs, sourceName: "vaplayer" };
     var out = [];
     data.data.stream_urls.forEach(function(u) {
       if (typeof u !== "string" || !/^https?:\/\//i.test(u)) return;
       out.push(makeStream(ctx, u, label, 1000000, VAPLAYER_HEADERS, subs));
     });
-    log("vaplayer returned " + out.length + " stream(s)");
+    log("vaplayer: " + out.length + " stream(s)");
     return out;
   }).catch(function(e) {
     log("vaplayer failed: " + (e && e.message));
@@ -400,64 +418,40 @@ function vaplayerStage(ctx, type, season, episode) {
 }
 
 function getStreamsFor(tmdbId, type, season, episode) {
-  var ctx = {
-    tmdbId: tmdbId,
-    displayTitle: type === "movie" ? "TMDB " + tmdbId : "TMDB " + tmdbId + " S" + pad2(season) + "E" + pad2(episode),
-    subtitles: []
-  };
-
   var metaP = fetchMeta(tmdbId, type).catch(function() { return null; });
+
   return metaP.then(function(meta) {
-    applyMeta(ctx, meta, type, season, episode);
-
-    function trySource(i) {
-      if (i >= SOURCES.length) {
-        log("all sources exhausted, trying vaplayer");
-        if (!USE_VAPLAYER_FALLBACK) return Promise.resolve([]);
-        return vaplayerStage(ctx, type, season, episode);
-      }
-      return callApi(SOURCES[i], tmdbId, type, season, episode).then(function(data) {
-        if (!data) {
-          log(SOURCES[i] + ": no response");
-          return trySource(i + 1);
-        }
-
-        var found = [];
-        walkMedia(data, found, 0, "");
-        found = unique(found);
-        found.sort(function(a, b) {
-          return (/\.m3u8/i.test(b) ? 1 : 0) - (/\.m3u8/i.test(a) ? 1 : 0);
-        });
-
-        if (!found.length) {
-          log(SOURCES[i] + ": no media url in reply");
-          return trySource(i + 1);
-        }
-
-        var subs = [];
-        walkSubs(data, subs, 0, false);
-        ctx.subtitles = unique(subs);
-
-        log(SOURCES[i] + ": " + found.length + " url(s) found");
-        return Promise.all(found.map(function(u) { return expandSource(u, ctx); })).then(function(groups) {
-          var seen = {};
-          var out = [];
-          groups.forEach(function(g) {
-            g.forEach(function(s) {
-              if (seen[s.url]) return;
-              seen[s.url] = true;
-              out.push(s);
-            });
-          });
-          out.sort(function(a, b) { return b._rank - a._rank; });
-          out.forEach(function(s) { delete s._rank; });
-          log("Returned " + out.length + " stream(s) via " + SOURCES[i]);
-          return out;
-        });
-      });
+    var baseDisplayTitle = type === "movie"
+      ? "TMDB " + tmdbId
+      : "TMDB " + tmdbId + " S" + pad2(season) + "E" + pad2(episode);
+    if (meta && meta.title) {
+      baseDisplayTitle = type === "movie"
+        ? meta.title + (meta.year ? " (" + meta.year + ")" : "")
+        : meta.title + " S" + pad2(season) + "E" + pad2(episode);
     }
 
-    return trySource(0);
+    var tasks = SOURCES.map(function(src) {
+      return sourceStreams(src, tmdbId, type, season, episode, baseDisplayTitle);
+    });
+    if (USE_VAPLAYER_FALLBACK) {
+      tasks.push(vaplayerStreams(tmdbId, type, season, episode, baseDisplayTitle));
+    }
+
+    return Promise.all(tasks).then(function(groups) {
+      var seen = {};
+      var out = [];
+      groups.forEach(function(g) {
+        g.forEach(function(s) {
+          if (seen[s.url]) return;
+          seen[s.url] = true;
+          out.push(s);
+        });
+      });
+      out.sort(function(a, b) { return b._rank - a._rank; });
+      out.forEach(function(s) { delete s._rank; });
+      log("Returned " + out.length + " total stream(s) from all sources");
+      return out;
+    });
   }).catch(function(err) {
     log("FAILED: " + (err && err.message));
     return [];
