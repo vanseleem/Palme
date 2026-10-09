@@ -1,235 +1,185 @@
+var PROVIDER_ID = "atlantic";
+var PROVIDER_NAME = "Atlantic";
 
+var USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36";
+var HELIOS_BASE = "https://stream.hls.lol";
+var AES_GCM_KEY_HEX = "117c358bcfcaf8fe2cfca57c9d2238a300e1c4de2efb83a5012ba84d8a31f1dd";
 
-var __async = (__this, __arguments, generator) => {
-  return new Promise((resolve, reject) => {
-    var fulfilled = (value) => {
-      try {
-        step(generator.next(value));
-      } catch (e) {
-        reject(e);
-      }
-    };
-    var rejected = (value) => {
-      try {
-        step(generator.throw(value));
-      } catch (e) {
-        reject(e);
-      }
-    };
-    var step = (x) => x.done ? resolve(x.value) : Promise.resolve(x.value).then(fulfilled, rejected);
-    step((generator = generator.apply(__this, __arguments)).next());
-  });
-};
+// Per-server endpoints — each returns its own {sources: {...}}
+var ENDPOINTS = ["moscow", "planets", "saturn", "nova", "omsk"];
 
-// Configuration
-const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36";
-const HELIOS_API = "https://justice.hls.lol";
-const AES_GCM_KEY_HEX = "117c358bcfcaf8fe2cfca57c9d2238a300e1c4de2efb83a5012ba84d8a31f1dd";
+function log(m) { console.log("[Atlantic] " + m); }
 
-/**
- * Hex string to Uint8Array (for browser/Node.js)
- */
 function hexToBytes(hex) {
-  const bytes = new Uint8Array(hex.length / 2);
-  for (let i = 0; i < hex.length; i += 2) {
+  var bytes = new Uint8Array(hex.length / 2);
+  for (var i = 0; i < hex.length; i += 2) {
     bytes[i / 2] = parseInt(hex.substr(i, 2), 16);
   }
   return bytes;
 }
 
-/**
- * Decrypt AES-GCM encrypted Helios URL
- * Payload format: IV (12 bytes) + ciphertext + tag
- */
-function decryptHeliosUrl(encryptedUrl) {
-  return __async(this, null, function* () {
-    try {
-      // Check if already decrypted
-      if (!encryptedUrl.startsWith("hl_")) {
-        return encryptedUrl;
-      }
+function utf8Decode(bytes) {
+  var out = "";
+  for (var i = 0; i < bytes.length; i++) out += String.fromCharCode(bytes[i]);
+  try { return decodeURIComponent(escape(out)); } catch (e) { return out; }
+}
 
-      // Strip "hl_" prefix and hex-decode
-      const hexPayload = encryptedUrl.slice(3);
-      const encryptedBytes = hexToBytes(hexPayload);
-
-      // Validate minimum length (12 IV + 16 tag + at least 1 byte ciphertext)
-      if (encryptedBytes.length < 29) {
-        throw new Error("Helios payload too short");
-      }
-
-      // Extract IV (first 12 bytes) and ciphertext (rest)
-      const iv = encryptedBytes.slice(0, 12);
-      const ciphertext = encryptedBytes.slice(12);
-
-      // Check if crypto.subtle is available (Node.js 15+, modern browsers, Cloudflare)
-      if (typeof crypto === "undefined" || !crypto.subtle) {
-        console.error("[Atlantic] crypto.subtle not available. Decryption failed.");
-        return encryptedUrl; // Fallback: return as-is
-      }
-
-      // Import the decryption key
-      const keyBytes = hexToBytes(AES_GCM_KEY_HEX);
-      const cryptoKey = yield crypto.subtle.importKey(
-        "raw",
-        keyBytes,
-        { name: "AES-GCM" },
-        false,
-        ["decrypt"]
-      );
-
-      // Decrypt using AES-GCM
-      const decrypted = yield crypto.subtle.decrypt(
-        { name: "AES-GCM", iv: iv },
-        cryptoKey,
-        ciphertext
-      );
-
-      // Convert to string
-      return new TextDecoder().decode(decrypted);
-    } catch (error) {
-      console.error("[Atlantic] Decryption error:", error.message);
-      throw error;
+function decryptAtlanticUrl(encryptedUrl) {
+  return new Promise(function(resolve, reject) {
+    if (!encryptedUrl || typeof encryptedUrl !== "string") {
+      reject(new Error("Empty URL"));
+      return;
     }
+    var m = /^([a-z]{2})_(.+)$/i.exec(encryptedUrl);
+    if (!m) { resolve(encryptedUrl); return; }
+
+    var hexPayload = m[2];
+    var encryptedBytes = hexToBytes(hexPayload);
+    if (encryptedBytes.length < 29) {
+      reject(new Error("Payload too short (" + encryptedBytes.length + " bytes)"));
+      return;
+    }
+    var iv = encryptedBytes.slice(0, 12);
+    var ciphertext = encryptedBytes.slice(12);
+    if (typeof crypto === "undefined" || !crypto.subtle) {
+      log("crypto.subtle unavailable");
+      resolve(encryptedUrl);
+      return;
+    }
+    var keyBytes = hexToBytes(AES_GCM_KEY_HEX);
+    crypto.subtle.importKey("raw", keyBytes, { name: "AES-GCM" }, false, ["decrypt"])
+      .then(function(k) {
+        return crypto.subtle.decrypt({ name: "AES-GCM", iv: iv }, k, ciphertext);
+      })
+      .then(function(d) {
+        resolve(utf8Decode(new Uint8Array(d)));
+      })
+      .catch(function(err) { reject(err); });
   });
 }
 
-/**
- * Fetch from Helios API
- */
-function fetchHelios(tmdbId, mediaType, season, episode) {
-  return __async(this, null, function* () {
-    try {
-      // Build query parameters
-      const params = new URLSearchParams();
-      params.set("tmdbId", String(tmdbId));
-      params.set("type", mediaType);
+function buildQuery(pairs) {
+  var out = [];
+  for (var i = 0; i < pairs.length; i++) {
+    out.push(encodeURIComponent(pairs[i][0]) + "=" + encodeURIComponent(pairs[i][1]));
+  }
+  return out.join("&");
+}
 
-      if (mediaType === "tv") {
-        params.set("seasonId", String(season || 1));
-        params.set("episodeId", String(episode || 1));
+function fetchEndpoint(name, tmdbId, mediaType, season, episode) {
+  return new Promise(function(resolve) {
+    var pairs = [["tmdbId", String(tmdbId)], ["type", mediaType]];
+    if (mediaType === "tv") {
+      pairs.push(["seasonId", String(season || 1)]);
+      pairs.push(["episodeId", String(episode || 1)]);
+    }
+    var url = HELIOS_BASE + "/" + name + "?" + buildQuery(pairs);
+    log("GET /" + name);
+
+    fetch(url, {
+      headers: {
+        "User-Agent": USER_AGENT,
+        "Accept": "application/json",
+        "Referer": "https://atlantic.st/",
+        "Origin": "https://atlantic.st"
       }
-
-      const url = `${HELIOS_API}/helios?${params.toString()}`;
-      
-      console.log("[Atlantic] Fetching:", url);
-
-      const response = yield fetch(url, {
-        headers: {
-          "User-Agent": USER_AGENT,
-          "Accept": "application/json"
-        },
-        signal: AbortSignal.timeout(10000)
+    })
+      .then(function(r) {
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        return r.json();
+      })
+      .then(function(data) { resolve(data); })
+      .catch(function(e) {
+        log("/" + name + " failed: " + (e && e.message));
+        resolve(null);
       });
-
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`);
-      }
-
-      const data = yield response.json();
-      console.log("[Atlantic] Got response, sources:", Object.keys(data.sources || {}));
-
-      return data.sources || {};
-    } catch (error) {
-      console.error("[Atlantic] Helios fetch failed:", error.message);
-      return {};
-    }
   });
 }
 
-/**
- * Build stream object
- */
-function makeStream(url, server, quality) {
+function makeStream(url, serverName, quality) {
   return {
-    name: "Atlantic",
-    title: `Atlantic • ${server}`,
+    name: PROVIDER_NAME + " " + quality,
+    title: "\u2728 " + serverName + " \u2022 " + quality,
     url: url,
-    quality: quality || "Auto",
+    quality: quality,
     headers: {
       "User-Agent": USER_AGENT,
-      "Referer": "https://atlantic.st/"
-    }
+      "Referer": "https://atlantic.st/",
+      "Origin": "https://atlantic.st"
+    },
+    provider: PROVIDER_ID
   };
 }
 
-/**
- * Main getStreams function for Nuvio
- */
 function getStreams(tmdbId, mediaType, season, episode) {
-  return __async(this, null, function* () {
-    console.log("[Atlantic] Request:", {
-      tmdbId: tmdbId,
-      mediaType: mediaType,
-      season: season,
-      episode: episode
+  return new Promise(function(resolve) {
+    log("Request: " + tmdbId + " " + mediaType + " S" + season + "E" + episode);
+    if (!tmdbId) { resolve([]); return; }
+    if (mediaType === "tv" && (!season || !episode)) { resolve([]); return; }
+
+    var endpointPromises = ENDPOINTS.map(function(name) {
+      return fetchEndpoint(name, tmdbId, mediaType, season, episode);
     });
 
-    // Validate inputs
-    if (!tmdbId) {
-      console.log("[Atlantic] No TMDB ID");
-      return [];
-    }
+    Promise.all(endpointPromises).then(function(results) {
+      var encrypted = [];
 
-    if (mediaType !== "movie" && mediaType !== "tv") {
-      console.log("[Atlantic] Invalid media type:", mediaType);
-      return [];
-    }
+      results.forEach(function(resp, i) {
+        if (!resp) return;
 
-    if (mediaType === "tv" && (!season || !episode)) {
-      console.log("[Atlantic] Missing season/episode for TV");
-      return [];
-    }
-
-    try {
-      // Fetch from Helios
-      const sources = yield fetchHelios(tmdbId, mediaType, season, episode);
-
-      if (!Object.keys(sources).length) {
-        console.log("[Atlantic] No sources found");
-        return [];
-      }
-
-      // Process sources
-      const streams = [];
-      const serverOrder = ["Moscow", "Novo", "Omsk"];
-      const seen = new Set();
-
-      for (const serverName of serverOrder) {
-        const source = sources[serverName];
-        if (!source || !source.url) {
-          continue;
+        // Per-server response: {sources: {Moscow: {url: "ms_...", type: "hls"}}}
+        if (resp.sources && typeof resp.sources === "object") {
+          Object.keys(resp.sources).forEach(function(k) {
+            var s = resp.sources[k];
+            if (s && s.url && typeof s.url === "string" && s.type !== "dash") {
+              encrypted.push({
+                url: s.url,
+                server: s.server || k,
+                label: s.label || "AUTO"
+              });
+            }
+          });
         }
 
-        try {
-          // Decrypt the URL
-          const m3u8Url = yield decryptHeliosUrl(source.url);
-          
-          // Avoid duplicates
-          if (seen.has(m3u8Url)) {
-            continue;
-          }
-          seen.add(m3u8Url);
-
-          // Add stream
-          streams.push(makeStream(m3u8Url, serverName, source.label || "Auto"));
-          console.log(`[Atlantic] Added ${serverName}: ${m3u8Url.substring(0, 80)}...`);
-        } catch (decryptError) {
-          console.error(`[Atlantic] Failed to decrypt ${serverName}:`, decryptError.message);
-          continue;
+        // Top-level URL fallback
+        if (typeof resp.url === "string" && /^[a-z]{2}_/i.test(resp.url)) {
+          encrypted.push({ url: resp.url, server: ENDPOINTS[i], label: "AUTO" });
         }
-      }
+      });
 
-      console.log("[Atlantic] Total streams:", streams.length);
-      return streams;
-    } catch (error) {
-      console.error("[Atlantic] getStreams error:", error.message);
-      return [];
-    }
+      log("Collected " + encrypted.length + " encrypted URL(s)");
+
+      var decPromises = encrypted.map(function(item) {
+        return decryptAtlanticUrl(item.url).then(function(decrypted) {
+          log(item.server + " -> " + decrypted.substring(0, 80));
+          return { url: decrypted, server: item.server, label: item.label };
+        }).catch(function(e) {
+          log(item.server + " decrypt failed: " + (e && e.message));
+          return null;
+        });
+      });
+
+      return Promise.all(decPromises).then(function(decryptedList) {
+        var streams = [];
+        var seen = {};
+        decryptedList.forEach(function(item) {
+          if (!item) return;
+          if (seen[item.url]) return;
+          seen[item.url] = true;
+          streams.push(makeStream(item.url, item.server, "AUTO"));
+        });
+        log("Returned " + streams.length + " stream(s)");
+        resolve(streams);
+      });
+    }).catch(function(e) {
+      log("getStreams error: " + (e && e.message));
+      resolve([]);
+    });
   });
 }
 
-// Export for Nuvio
-module.exports = {
-  getStreams: getStreams
-};
+if (typeof module !== "undefined" && module.exports) {
+  module.exports = { getStreams: getStreams };
+} else {
+  global.getStreams = getStreams;
+}
