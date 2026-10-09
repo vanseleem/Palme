@@ -1,15 +1,12 @@
-var PROVIDER_ID = "saturn";
-var PROVIDER_NAME = "Saturn";
+var PROVIDER_ID = "aurora";
+var PROVIDER_NAME = "Aurora";
 
 var API_BASE = "https://player.vidflix.club/api/vidora/v1";
 var SITE = "https://player.vidflix.club";
 var PLAYER_KEY = "f3b72e73c80c9a996574379798703796a1936efa3516a7105cb0e43048b46b5a";
 
-// Sources tried in order. scrapify is the primary (netoda.tech CDN);
-// fsonic is the fallback (same as PressPlayX).
 var SOURCES = ["scrapify", "fsonic"];
 
-// CDN header candidates, tried in parallel (first valid playlist wins)
 var CDN_CANDIDATES = [
   { referer: "https://player.vidflix.club/", origin: "https://player.vidflix.club" },
   { referer: "https://netoda.tech/",         origin: "https://netoda.tech" },
@@ -22,7 +19,6 @@ var CDN_RULES = [
   { host: "netoda.tech", referers: ["https://netoda.tech/"],          origin: "https://netoda.tech" }
 ];
 
-// vaplayer fallback (proven working in PressPlayX)
 var USE_VAPLAYER_FALLBACK = true;
 var VAPLAYER_API = "https://streamdata.vaplayer.ru/api.php";
 var VAPLAYER_HEADERS = {
@@ -78,11 +74,6 @@ function absUrl(base, rel) {
     else if (seg !== ".") parts.push(seg);
   });
   return origin + parts.join("/");
-}
-
-function originOf(url) {
-  var m = /^(https?:\/\/[^\/]+)/i.exec(url || "");
-  return m ? m[1] : "";
 }
 
 function pad2(n) { return n < 10 ? "0" + n : String(n); }
@@ -156,7 +147,6 @@ function headersOf(c) {
   return c.full || cdnHeaders(c.referer, c.origin);
 }
 
-// ---------------------------------------------------------------- response walking
 var SUB_KEY = /sub|caption|track|thumb|poster|preview|vtt|srt/i;
 var SUB_URL = /\.(vtt|srt|ass|ssa|jpg|jpeg|png|webp|gif|svg)(\?|#|$)/i;
 var MEDIA_KEY = /^(url|file|src|link|playlist|stream|source|hls|m3u8|manifest)$/i;
@@ -214,7 +204,6 @@ function unique(list) {
   });
 }
 
-// ---------------------------------------------------------------- HLS
 function parseMaster(masterUrl, text) {
   var lines = text.split(/\r?\n/);
   var byKey = {};
@@ -290,7 +279,6 @@ function firstValid(tasks) {
   });
 }
 
-// Returns ONE stream with the top quality — player handles ABR internally.
 function expandSource(url, ctx, opts) {
   var cands = buildCands(url, opts);
   return firstValid(cands.map(function(c) { return tryCandidate(url, c); })).then(function(x) {
@@ -303,14 +291,22 @@ function expandSource(url, ctx, opts) {
     var finalUrl = /^https?:\/\//i.test(r.url || "") ? r.url : url;
     var master = parseMaster(finalUrl, r.text);
     var top = labelFromRes(master.best.w, master.best.h);
-    return [makeStream(ctx, finalUrl, top, 1000000, hdr, ctx.subtitles)];
+
+    if (master.variants.length < 2 || master.hasSeparateAudio) {
+      return [makeStream(ctx, finalUrl, top, 1000000, hdr, ctx.subtitles)];
+    }
+
+    var out = [makeStream(ctx, finalUrl, "Auto", 1000000, hdr, ctx.subtitles)];
+    master.variants.forEach(function(v) {
+      out.push(makeStream(ctx, v.url, v.label, rankOf(v.label), hdr, ctx.subtitles));
+    });
+    return out;
   }).catch(function(e) {
     log("expand failed: " + (e && e.message));
     return [makeStream(ctx, url, "Auto", 1000000, headersOf(cands[0]), ctx.subtitles)];
   });
 }
 
-// ---------------------------------------------------------------- TMDB metadata
 function fetchMeta(tmdbId, type) {
   var url = "https://api.themoviedb.org/3/" + type + "/" + encodeURIComponent(tmdbId) +
     "?api_key=" + TMDB_API_KEY + "&language=en&append_to_response=external_ids";
@@ -335,7 +331,6 @@ function applyMeta(ctx, meta, type, season, episode) {
   }
 }
 
-// ---------------------------------------------------------------- VidFlix API
 function apiHeaders() {
   return {
     "User-Agent": UA,
@@ -355,7 +350,7 @@ function callApi(source, tmdbId, type, season, episode) {
 
   return request(url, apiHeaders()).then(function(r) {
     var data = null;
-    try { data = JSON.parse(r.text); } catch (e) { /* not JSON */ }
+    try { data = JSON.parse(r.text); } catch (e) { }
     if (!r.ok || !data || data.result === false) {
       return null;
     }
@@ -363,7 +358,6 @@ function callApi(source, tmdbId, type, season, episode) {
   }).catch(function() { return null; });
 }
 
-// ---------------------------------------------------------------- vaplayer fallback
 function vaplayerStage(ctx, type, season, episode) {
   var url = VAPLAYER_API + "?tmdb=" + encodeURIComponent(ctx.tmdbId) + "&type=" + type;
   if (type === "tv") url += "&season=" + season + "&episode=" + episode;
@@ -371,7 +365,7 @@ function vaplayerStage(ctx, type, season, episode) {
 
   return request(url, VAPLAYER_HEADERS).then(function(r) {
     var data = null;
-    try { data = JSON.parse(r.text); } catch (e) { /* not JSON */ }
+    try { data = JSON.parse(r.text); } catch (e) { }
     if (!r.ok || !data || data.status_code != 200 || !data.data || !Array.isArray(data.data.stream_urls)) {
       log("vaplayer: nothing");
       return [];
@@ -405,7 +399,6 @@ function vaplayerStage(ctx, type, season, episode) {
   });
 }
 
-// ---------------------------------------------------------------- core
 function getStreamsFor(tmdbId, type, season, episode) {
   var ctx = {
     tmdbId: tmdbId,
@@ -417,7 +410,6 @@ function getStreamsFor(tmdbId, type, season, episode) {
   return metaP.then(function(meta) {
     applyMeta(ctx, meta, type, season, episode);
 
-    // Try each source in order until one returns streams
     function trySource(i) {
       if (i >= SOURCES.length) {
         log("all sources exhausted, trying vaplayer");
