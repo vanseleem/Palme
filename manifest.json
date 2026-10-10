@@ -4,7 +4,7 @@
   "scrapers": [
     {
       "id": "kirmalk",
-      "name": "Kirmalk",
+      "name": "🇯🇴 Kirmalk",
       "description": "Movies and TV series via Vortex backend",
       "version": "1.0.0",
       "author": "vanseleem",
