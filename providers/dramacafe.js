@@ -1,6 +1,7 @@
 var BASE = "https://ddramacafe-tv.bar";
 var UA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Mobile Safari/537.36";
 var TMDB_API_KEY = "83d364331c40bfbe29858aeed82f45cc";
+var MAX_SERVERS = 4;
 
 function fetchText(url, referer) {
   url = String(url).replace(/[^\x00-\x7F]/g, function(c) {
@@ -225,8 +226,8 @@ function makeStream(url, label, playerUrl) {
   }
 
   return {
-    name: "🎖️ DramaCafe",
-    title: label ? "🎖️ DramaCafe \u2022 " + label : "⚜️ DramaCafe",
+    name: "DramaCafe",
+    title: label ? "DramaCafe \u2022 " + label : "DramaCafe",
     url: url,
     quality: qualityFromUrl(url),
     referer: streamReferer,
