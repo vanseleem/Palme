@@ -1,7 +1,23 @@
 var BASE = "https://ddramacafe-tv.casa";
 var UA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Mobile Safari/537.36";
 var TMDB_API_KEY = "83d364331c40bfbe29858aeed82f45cc";
-var MAX_SERVERS = 11;
+var MAX_SERVERS = 4;
+var REQUEST_TIMEOUT = 10000;
+
+function withTimeout(promise, ms) {
+  if (typeof setTimeout !== "function" || typeof clearTimeout !== "function") return promise;
+  return new Promise(function(resolve, reject) {
+    var done = false;
+    var t = setTimeout(function() {
+      if (!done) { done = true; reject(new Error("timeout")); }
+    }, ms);
+    promise.then(function(v) {
+      if (!done) { done = true; clearTimeout(t); resolve(v); }
+    }, function(e) {
+      if (!done) { done = true; clearTimeout(t); reject(e); }
+    });
+  });
+}
 
 function fetchText(url, referer) {
   url = String(url).replace(/[^\x00-\x7F]/g, function(c) {
@@ -14,10 +30,10 @@ function fetchText(url, referer) {
   if (referer) headers["Referer"] = String(referer).replace(/[^\x00-\x7F]/g, function(c) {
     return encodeURIComponent(c);
   });
-  return fetch(url, { headers: headers, redirect: "follow" }).then(function(r) {
+  return withTimeout(fetch(url, { headers: headers, redirect: "follow" }).then(function(r) {
     if (!r.ok) throw new Error("HTTP " + r.status);
     return r.text();
-  });
+  }), REQUEST_TIMEOUT);
 }
 
 function decodeHtml(str) {
@@ -28,13 +44,6 @@ function decodeHtml(str) {
     .replace(/&#39;/g, "'")
     .replace(/&lt;/g, "<")
     .replace(/&gt;/g, ">");
-}
-
-function stripHtml(str) {
-  return decodeHtml(String(str || ""))
-    .replace(/<[^>]+>/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
 }
 
 function normalizeTitle(str) {
@@ -58,6 +67,26 @@ function similarity(a, b) {
   var common = 0;
   aa.forEach(function(x) { if (setB[x]) common++; });
   return common / Math.max(aa.length, bb.length);
+}
+
+function absUrl(u, base) {
+  u = decodeHtml(String(u || "")).replace(/\\\//g, "/").replace(/\\u0026/g, "&").trim();
+  if (!u) return "";
+  if (/^https?:\/\//i.test(u)) return u;
+  if (u.indexOf("//") === 0) return "https:" + u;
+  var origin = String(base || BASE).replace(/^(https?:\/\/[^\/]+).*$/i, "$1");
+  if (u.charAt(0) === "/") return origin + u;
+  return origin + "/" + u;
+}
+
+function originOf(url) {
+  var m = String(url || "").match(/^(https?:\/\/[^\/]+)/i);
+  return m ? m[1] : "";
+}
+
+function hostOf(url) {
+  var m = String(url || "").match(/^https?:\/\/([^\/?#:]+)/i);
+  return m ? m[1].toLowerCase() : "";
 }
 
 function getTmdbTitles(tmdbId, mediaType) {
@@ -138,50 +167,46 @@ function buildEmbedUrl(vid) {
   return BASE + "/embed.php?vid=" + vid;
 }
 
-function findPlayerIframe(embedHtml) {
-  var m = embedHtml.match(/<iframe[^>]*src=["']([^"']+)["']/i);
-  if (m) {
-    var u = decodeHtml(m[1]);
-    if (u.indexOf("//") === 0) u = "https:" + u;
-    if (u.indexOf("/") === 0) u = BASE + u;
-    return u;
-  }
-  m = embedHtml.match(/contentUrl["'][^>]*content=["']([^"']+)["']/i);
-  if (m) {
-    var u2 = decodeHtml(m[1]);
-    if (u2.indexOf("//") === 0) u2 = "https:" + u2;
-    return u2;
-  }
+function buildPlayUrl(vid) {
+  return BASE + "/play.php?vid=" + vid;
+}
+
+function findPlayerIframe(html, pageUrl) {
+  var m = html.match(/<iframe[^>]*src=["']([^"']+)["']/i);
+  if (m) return absUrl(m[1], pageUrl);
   return null;
 }
 
+function decodePackedToken(word, base) {
+  var chars = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+  var n = 0;
+  for (var i = 0; i < word.length; i++) {
+    var d = chars.indexOf(word.charAt(i));
+    if (d < 0 || d >= base) return -1;
+    n = n * base + d;
+  }
+  return n;
+}
+
 function unpackEval(html) {
-  var m = html.match(/eval\(function\(p,a,c,k,e,d\)\{[\s\S]*?\}\('([\s\S]*?)',(\d+),(\d+),'([\s\S]*?)'\.split\('\|'\)/);
+  var m = html.match(/\}\('([\s\S]*?)',\s*(\d+),\s*(\d+),\s*'([\s\S]*?)'\.split\('\|'\)/);
   if (!m) return null;
   var payload = m[1];
   var base = parseInt(m[2], 10);
-  var count = parseInt(m[3], 10);
   var keywords = m[4].split("|");
-  while (count--) {
-    if (keywords[count]) {
-      var key = keywords[count];
-      var pat = new RegExp("\\b" + count.toString(base) + "\\b", "g");
-      payload = payload.replace(pat, function() { return key; });
-    }
-  }
-  return payload;
+  return payload.replace(/\b\w+\b/g, function(w) {
+    var idx = decodePackedToken(w, base);
+    return (idx >= 0 && keywords[idx]) ? keywords[idx] : w;
+  });
 }
 
-function extractStreamsFromPlayer(playerHtml) {
+function scanForStreams(text) {
   var streams = [];
   var seen = {};
-  var unpacked = unpackEval(playerHtml);
-  var search = unpacked || playerHtml;
-  console.log("[DramaCafe] unpacked:", unpacked ? "yes (" + search.length + " chars)" : "no");
+  var m;
 
   var re = /https?:\/\/[^"'\s<>\\]+\.(?:m3u8|mp4)[^"'\s<>\\]*/gi;
-  var m;
-  while ((m = re.exec(search)) !== null) {
+  while ((m = re.exec(text)) !== null) {
     var u = m[0].replace(/\\\//g, "/").replace(/\\u0026/g, "&");
     if (seen[u]) continue;
     seen[u] = 1;
@@ -189,79 +214,95 @@ function extractStreamsFromPlayer(playerHtml) {
   }
 
   var re2 = /(?:file|source|src|url)\s*[:=]\s*["']([^"']+\.(?:m3u8|mp4)[^"']*)["']/gi;
-  while ((m = re2.exec(search)) !== null) {
+  while ((m = re2.exec(text)) !== null) {
     var u2 = m[1].replace(/\\\//g, "/");
     if (u2.indexOf("http") !== 0) continue;
     if (seen[u2]) continue;
     seen[u2] = 1;
     streams.push(u2);
   }
-
-  console.log("[DramaCafe] m3u8/mp4 found:", streams.length);
   return streams;
 }
 
-function extractDood(embedUrl) {
-  return fetchText(embedUrl, BASE + "/").then(function(html) {
-    var pm = html.match(/["'](\/pass_md5\/[^"']+)["']/i);
-    if (!pm) return [];
-    var tk = pm[1].match(/\/pass_md5\/([^\/?#]+)/);
-    var token = tk ? tk[1] : '';
-    var exm = html.match(/[?&]expiry=([0-9]+)/i);
-    var expiry = exm ? exm[1] : String(Math.floor(Date.now() / 1000) + 3600);
-    var origin = originOf(embedUrl);
-    return fetchText(origin + pm[1], embedUrl).then(function(base) {
-      base = String(base || '').trim();
-      if (!base || base.length < 10 || !/^https?:/i.test(base)) return [];
-      var chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
-      var rnd = '';
-      for (var i = 0; i < 10; i++) rnd += chars.charAt(Math.floor(Math.random() * chars.length));
-      return [{ url: base + rnd + '?token=' + token + '&expiry=' + expiry, quality: 'Auto' }];
-    });
+function extractStreamsFromPlayer(playerHtml) {
+  var unpacked = null;
+  try { unpacked = unpackEval(playerHtml); } catch (e) {}
+  var found = unpacked ? scanForStreams(unpacked) : [];
+  if (!found.length) found = scanForStreams(playerHtml);
+  return found;
+}
+
+function extractVk(html, embedUrl) {
+  var headers = { "User-Agent": UA, "Referer": "https://vk.com/" };
+  var out = [];
+  var re = /"url(\d{3,4})"\s*:\s*"(https?:[^"]+)"/g;
+  var m;
+  while ((m = re.exec(html)) !== null) {
+    out.push({ url: m[2].replace(/\\\//g, '/'), quality: m[1] + 'p', headers: headers });
+  }
+  if (!out.length) {
+    var hls = /"hls"\s*:\s*"(https?:[^"]+)"/.exec(html);
+    if (hls) out.push({ url: hls[1].replace(/\\\//g, '/'), quality: 'Auto', headers: headers });
+  }
+  return out;
+}
+
+var OK_QUALITY = { mobile: '144p', lowest: '240p', low: '360p', sd: '480p', hd: '720p', full: '1080p', quad: '1440p', ultra: '2160p' };
+
+function extractOk(html, embedUrl) {
+  var headers = { "User-Agent": UA, "Referer": "https://ok.ru/" };
+  var out = [];
+  var m = /data-options\s*=\s*"([^"]+)"/.exec(html);
+  if (m) {
+    try {
+      var options = JSON.parse(decodeHtml(m[1]));
+      var meta = options && options.flashvars && options.flashvars.metadata;
+      if (typeof meta === 'string') meta = JSON.parse(meta);
+      if (meta) {
+        (meta.videos || []).forEach(function(v) {
+          if (v && v.url) out.push({ url: v.url, quality: OK_QUALITY[v.name] || 'Auto', headers: headers });
+        });
+        var hls = meta.hlsManifestUrl || meta.ondemandHls || meta.hlsMasterPlaylistUrl;
+        if (hls) out.push({ url: hls, quality: 'Auto', headers: headers });
+        if (out.length) return out;
+      }
+    } catch (e) {}
+  }
+  var mm = /"hlsManifestUrl"\s*:\s*"([^"]+)"/i.exec(html);
+  if (mm) return [{ url: mm[1], quality: 'Auto', headers: headers }];
+  mm = /"videoUrl"\s*:\s*"([^"]+)"/i.exec(html);
+  if (mm) return [{ url: mm[1], quality: 'Auto', headers: headers }];
+  return out;
+}
+
+function extractDood(html, embedUrl) {
+  var pm = html.match(/["'](\/pass_md5\/[^"']+)["']/i);
+  if (!pm) return [];
+  var tk = pm[1].match(/\/pass_md5\/([^\/?#]+)/);
+  var token = tk ? tk[1] : '';
+  var exm = html.match(/[?&]expiry=([0-9]+)/i);
+  var expiry = exm ? exm[1] : String(Math.floor(Date.now() / 1000) + 3600);
+  var origin = originOf(embedUrl);
+  return fetchText(origin + pm[1], embedUrl).then(function(base) {
+    base = String(base || '').trim();
+    if (!base || base.length < 10 || !/^https?:/i.test(base)) return [];
+    var chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+    var rnd = '';
+    for (var i = 0; i < 10; i++) rnd += chars.charAt(Math.floor(Math.random() * chars.length));
+    return [{ url: base + rnd + '?token=' + token + '&expiry=' + expiry, quality: 'Auto' }];
   }).catch(function() { return []; });
 }
 
-function extractVk(embedUrl) {
-  return fetchText(embedUrl, BASE + "/").then(function(html) {
-    var out = [];
-    var re = /"url(\d{3,4})"\s*:\s*"(https?:[^"]+)"/g;
-    var m;
-    while ((m = re.exec(html)) !== null) {
-      out.push({ url: m[2].replace(/\\\//g, '/'), quality: m[1] + 'p' });
-    }
-    if (!out.length) {
-      var hls = /"hls"\s*:\s*"(https?:[^"]+)"/.exec(html);
-      if (hls) out.push({ url: hls[1].replace(/\\\//g, '/'), quality: 'Auto' });
-    }
-    return out;
-  }).catch(function() { return []; });
-}
-
-function extractOk(embedUrl) {
-  return fetchText(embedUrl, BASE + "/").then(function(html) {
-    var out = [];
-    var m = /data-options\s*=\s*"([^"]+)"/.exec(html);
-    if (m) {
-      try {
-        var options = JSON.parse(decodeHtml(m[1]));
-        var meta = options && options.flashvars && options.flashvars.metadata;
-        if (typeof meta === 'string') meta = JSON.parse(meta);
-        if (meta) {
-          (meta.videos || []).forEach(function(v) {
-            if (v && v.url) out.push({ url: v.url, quality: 'Auto' });
-          });
-          var hls = meta.hlsManifestUrl || meta.ondemandHls || meta.hlsMasterPlaylistUrl;
-          if (hls) out.push({ url: hls, quality: 'Auto' });
-          if (out.length) return out;
-        }
-      } catch (e) {}
-    }
-    var mm = /"hlsManifestUrl"\s*:\s*"([^"]+)"/i.exec(html);
-    if (mm) return [{ url: mm[1], quality: 'Auto' }];
-    mm = /"videoUrl"\s*:\s*"([^"]+)"/i.exec(html);
-    if (mm) return [{ url: mm[1], quality: 'Auto' }];
-    return out;
-  }).catch(function() { return []; });
+function extractGeneric(html, embedUrl) {
+  var urls = [];
+  var unpacked = null;
+  try { unpacked = unpackEval(html); } catch (e) {}
+  var search = unpacked || html;
+  var found = scanForStreams(search);
+  var headers = { "User-Agent": UA, "Referer": originOf(embedUrl) + "/" };
+  return found.map(function(u) {
+    return { url: u, quality: /\.m3u8/i.test(u) ? 'Auto' : 'Unknown', headers: headers };
+  });
 }
 
 function qualityFromUrl(url) {
@@ -284,24 +325,10 @@ function qualityRankValue(q) {
   return 0;
 }
 
-function originOf(url) {
-  var m = String(url || "").match(/^(https?:\/\/[^\/]+)/i);
-  return m ? m[1] : "";
-}
-
-function hostOf(url) {
-  var m = String(url || "").match(/^https?:\/\/([^\/?#:]+)/i);
-  return m ? m[1].toLowerCase() : "";
-}
-
 function makeStream(url, label, playerUrl, quality) {
   var origin = originOf(playerUrl) || BASE;
   var streamReferer = origin + "/";
-
-  if (url.indexOf("http://") === 0) {
-    url = "https://" + url.slice(7);
-  }
-
+  if (url.indexOf("http://") === 0) url = "https://" + url.slice(7);
   return {
     name: "DramaCafe",
     title: label ? "DramaCafe \u2022 " + label : "DramaCafe",
@@ -314,6 +341,17 @@ function makeStream(url, label, playerUrl, quality) {
       "Origin": origin,
       "Accept": "*/*"
     }
+  };
+}
+
+function makeEmbedFallback(playerUrl, label, referer) {
+  return {
+    name: "DramaCafe",
+    title: label ? "DramaCafe (Embed) \u2022 " + label : "DramaCafe (Embed)",
+    url: playerUrl,
+    quality: "Auto",
+    type: "iframe",
+    referer: referer
   };
 }
 
@@ -334,85 +372,81 @@ function parseServers(html) {
   return servers;
 }
 
-function resolveServer(server) {
+function resolveServer(server, playUrl) {
   var embedUrl = server.url;
   var host = hostOf(embedUrl);
 
-  var urlPromise;
-  if (/vk\.com|vkvideo\.ru/.test(host)) {
-    urlPromise = extractVk(embedUrl);
-  } else if (/ok\.ru/.test(host)) {
-    urlPromise = extractOk(embedUrl);
-  } else if (/dood|playmogo|uqload|ds2play|vidspeed|bysesukior/.test(host)) {
-    urlPromise = extractDood(embedUrl);
-  } else {
-    urlPromise = fetchText(embedUrl, BASE + "/").then(function(html) {
-      return extractStreamsFromPlayer(html).map(function(u) {
-        return { url: u, quality: qualityFromUrl(u) };
-      });
-    });
-  }
-
-  return urlPromise.then(function(items) {
-    if (!items.length) {
-      console.log("[DramaCafe] no direct URL for", server.name, "- skipping");
-      return [];
+  return fetchText(embedUrl, playUrl).then(function(html) {
+    var urlPromise;
+    if (/vk\.com|vkvideo\.ru/.test(host)) {
+      urlPromise = Promise.resolve(extractVk(html, embedUrl));
+    } else if (/ok\.ru/.test(host)) {
+      urlPromise = Promise.resolve(extractOk(html, embedUrl));
+    } else if (/dood|playmogo|uqload|ds2play|vidspeed|bysesukior/.test(host)) {
+      urlPromise = extractDood(html, embedUrl);
+    } else {
+      var direct = extractGeneric(html, embedUrl);
+      if (direct.length) {
+        urlPromise = Promise.resolve(direct);
+      } else {
+        var iframeUrl = findPlayerIframe(html, embedUrl);
+        if (iframeUrl) {
+          urlPromise = fetchText(iframeUrl, embedUrl).then(function(playerHtml) {
+            var innerDirect = extractGeneric(playerHtml, iframeUrl);
+            if (innerDirect.length) return innerDirect;
+            return [makeEmbedFallback(iframeUrl, server.name, embedUrl)];
+          }).catch(function() {
+            return [makeEmbedFallback(iframeUrl, server.name, embedUrl)];
+          });
+        } else {
+          urlPromise = Promise.resolve([makeEmbedFallback(embedUrl, server.name, playUrl)]);
+        }
+      }
     }
-    items.sort(function(a, b) { return qualityRankValue(b.quality) - qualityRankValue(a.quality); });
-    var best = items[0];
-    return [makeStream(best.url, server.name, embedUrl, best.quality)];
+
+    return urlPromise.then(function(items) {
+      if (!items.length) {
+        return [makeEmbedFallback(embedUrl, server.name, playUrl)];
+      }
+      items.sort(function(a, b) { return qualityRankValue(b.quality) - qualityRankValue(a.quality); });
+      return items;
+    });
   }).catch(function(err) {
     console.log("[DramaCafe] server error:", server.name, err.message);
-    return [];
-  });
-}
-
-function resolveSingleServer(vid) {
-  var embedUrl = buildEmbedUrl(vid);
-  return fetchText(embedUrl, BASE + "/").then(function(embedHtml) {
-    var playerUrl = findPlayerIframe(embedHtml);
-    if (!playerUrl) return [];
-    return fetchText(playerUrl, embedUrl).then(function(playerHtml) {
-      var directUrls = extractStreamsFromPlayer(playerHtml);
-      if (!directUrls.length) return [];
-      directUrls.sort(function(a, b) { return qualityRankValue(qualityFromUrl(b)) - qualityRankValue(qualityFromUrl(a)); });
-      return [makeStream(directUrls[0], "Server", playerUrl)];
-    }).catch(function(err) {
-      console.log("[DramaCafe] fallback player error:", err.message);
-      return [];
-    });
-  }).catch(function(err) {
-    console.log("[DramaCafe] fallback embed error:", err.message);
-    return [];
+    return [makeEmbedFallback(embedUrl, server.name, playUrl)];
   });
 }
 
 function resolveVid(vid) {
-  var playUrl = BASE + "/play.php?vid=" + vid;
-  console.log("[DramaCafe] play:", playUrl);
-  return fetchText(playUrl, BASE + "/").then(function(playHtml) {
+  var playUrl = buildPlayUrl(vid);
+  var videoUrl = BASE + "/video.php?vid=" + vid;
+
+  return fetchText(playUrl, videoUrl).then(function(playHtml) {
     var servers = parseServers(playHtml);
     console.log("[DramaCafe] servers found:", servers.length);
     if (!servers.length) {
-      console.log("[DramaCafe] no servers, falling back to single server");
-      return resolveSingleServer(vid);
+      return [];
     }
     return Promise.all(servers.map(function(s) {
-      return resolveServer(s);
+      return withTimeout(resolveServer(s, playUrl), REQUEST_TIMEOUT);
     })).then(function(groups) {
       var all = [];
-      groups.forEach(function(g) { all = all.concat(g); });
-      all = all.slice(0, MAX_SERVERS);
-      console.log("[DramaCafe] working streams:", all.length);
-      if (!all.length) {
-        console.log("[DramaCafe] none extracted, trying single-server fallback");
-        return resolveSingleServer(vid);
-      }
-      return all;
+      var seenUrl = {};
+      groups.forEach(function(g) {
+        g.forEach(function(st) {
+          if (seenUrl[st.url]) return;
+          seenUrl[st.url] = 1;
+          all.push(st);
+        });
+      });
+      var direct = all.filter(function(st) { return st.type !== "iframe"; });
+      var out = direct.length ? direct : all;
+      console.log("[DramaCafe] streams:", out.length, "(direct:", direct.length + ")");
+      return out;
     });
   }).catch(function(err) {
-    console.log("[DramaCafe] play page error:", err.message);
-    return resolveSingleServer(vid);
+    console.log("[DramaCafe] play.php failed:", err.message);
+    return [];
   });
 }
 
