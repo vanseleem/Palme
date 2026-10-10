@@ -643,27 +643,13 @@ function getSeriesStreams(meta, season, episode, title) {
 
 // ──────────────────────── Servers (play.php) ──────────────────────────
 
-// Known streaming-host keywords — used to whitelist candidate URLs.
-var KNOWN_HOST_PATTERN = '1vid|vidmoly|playmogo|uqload|dood|voe|streamtape|filemoon|upstream|mp4upload|sendvid|sibnet|mixdrop|ds2play|vidspeed|ok\\.ru|vk\\.com|vkvideo|hgcloud|vidhide|listeamed';
-
 function fetchEmbedUrls(vid) {
   return siteGet(BASE_URL + '/play.php?vid=' + vid, BASE_URL + '/watch.php?vid=' + vid).then(function (html) {
     var urls = [];
     var seen = {};
     var baseHost = hostOf(BASE_URL);
 
-    // Pre-unescape JS string escapes so URLs stored inside <script> tags
-    // (e.g. "https:\/\/hgcloud.to\/embed-abc.html") become matchable.
-    var text = html
-      .replace(/\\\//g, '/')
-      .replace(/\\u002F/gi, '/')
-      .replace(/\\u0026/gi, '&');
-
     function add(url) {
-      if (!url) return;
-      url = String(url).trim();
-      if (!url) return;
-      if (!/^(?:https?:)?\/\//i.test(url)) return;
       url = absoluteUrl(url, BASE_URL);
       if (!url || seen[url]) return;
       if (hostOf(url) === baseHost) return;
@@ -671,41 +657,18 @@ function fetchEmbedUrls(vid) {
       urls.push(url);
     }
 
-    function collect(re, source) {
-      source = source || text;
+    function collect(re) {
       var m;
-      while ((m = re.exec(source)) !== null) add(m[1]);
+      while ((m = re.exec(html)) !== null) add(m[1]);
     }
 
-    // 1. iframe src
     collect(/<iframe\b[^>]*?\ssrc\s*=\s*["']([^"']+)["']/gi);
+    collect(/data-[a-z0-9_-]+\s*=\s*["'](https?:\/\/[^"']+)["']/gi);
 
-    // 2. any src / href / data-* attribute holding a URL
-    collect(/\s(?:src|href|data-[a-z0-9_-]+)\s*=\s*["']((?:https?:)?\/\/[^"']+)["']/gi);
+    var reHost = /https?:\/\/[^"'\s<>]*(?:1vid|vidmoly|playmogo|uqload|dood|voe|streamtape|filemoon|upstream|mp4upload|sendvid|sibnet|mixdrop|ds2play|vidspeed|ok\.ru|vk\.com|vkvideo|hgcloud|vidhide|listeamed)[^"'\s<>]*/gi;
+    collect(reHost);
 
-    // 3. onclick handlers with a URL inside
-    var onclickRe = /onclick\s*=\s*["']([^"']+)["']/gi;
-    var om;
-    while ((om = onclickRe.exec(text)) !== null) {
-      var innerRe = /(?:https?:)?\/\/[^"'\s<>)]+/gi;
-      var im;
-      while ((im = innerRe.exec(om[1])) !== null) add(im[0]);
-    }
-
-    // 4. any external URL matching a known streaming host, anywhere in the page
-    collect(new RegExp('https?://[^"\'\\s<>]*(?:' + KNOWN_HOST_PATTERN + ')[^"\'\\s<>]*', 'gi'));
-
-    // 5. same whitelist but inside <script> tags (JS-built server lists)
-    var scriptRe = /<script\b[^>]*>([\s\S]*?)<\/script>/gi;
-    var sm;
-    while ((sm = scriptRe.exec(text)) !== null) {
-      var jsText = sm[1];
-      var jsRe = new RegExp('(?:https?:)?//[^"\'\\s<>]*(?:' + KNOWN_HOST_PATTERN + ')[^"\'\\s<>]*', 'gi');
-      var jm;
-      while ((jm = jsRe.exec(jsText)) !== null) add(jm[0]);
-    }
-
-    log('play.php raw candidates: ' + urls.length);
+    log('play.php extracted ' + urls.length + ' embed URL(s)');
     return urls;
   });
 }
@@ -940,29 +903,30 @@ function qualityRank(q) {
 
 function getServerStreams(vid, title) {
   return fetchEmbedUrls(vid).then(function (embedUrls) {
-    // Honour MAX_SERVERS — this is the knob you can raise/lower at will.
-    var limited = embedUrls.slice(0, MAX_SERVERS);
-    log('servers for ' + vid + ': ' + limited.length + ' of ' + embedUrls.length + ' (MAX_SERVERS=' + MAX_SERVERS + ')');
-    return Promise.all(limited.map(resolveEmbed));
+    log('servers for ' + vid + ': ' + embedUrls.length + ' found (MAX_SERVERS=' + MAX_SERVERS + ')');
+    return Promise.all(embedUrls.map(resolveEmbed));
   }).then(function (groups) {
     var streams = [];
-    var seen = {};
+    var seenServers = {};
     groups.forEach(function (items) {
-      items.forEach(function (it) {
-        if (seen[it.url]) return;
-        seen[it.url] = true;
-        streams.push({
-          name: PROVIDER_NAME + ' ' + it.server + (it.quality !== 'Unknown' ? ' ' + it.quality : ''),
-          title: title,
-          url: it.url,
-          quality: it.quality,
-          size: 'Unknown',
-          headers: it.headers,
-          provider: PROVIDER_ID
-        });
+      if (streams.length >= MAX_SERVERS) return;
+      if (!items.length) return;
+      // Keep only the best quality for this server.
+      items.sort(function (a, b) { return qualityRank(b.quality) - qualityRank(a.quality); });
+      var best = items[0];
+      if (seenServers[best.server]) return;
+      seenServers[best.server] = true;
+      streams.push({
+        name: PROVIDER_NAME + ' ' + best.server + (best.quality !== 'Unknown' ? ' ' + best.quality : ''),
+        title: title,
+        url: best.url,
+        quality: best.quality,
+        size: 'Unknown',
+        headers: best.headers,
+        provider: PROVIDER_ID
       });
     });
-    streams.sort(function (a, b) { return qualityRank(b.quality) - qualityRank(a.quality); });
+    log('returning ' + streams.length + ' unique server stream(s)');
     return streams;
   });
 }
