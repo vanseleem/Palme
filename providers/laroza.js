@@ -422,13 +422,114 @@ function getMovieStreams(tmdbId) {
   });
 }
 
+function arNorm(str) {
+  return String(str || "")
+    .replace(/[\u064B-\u065F\u0670\u0640]/g, "")                 // diacritics + tatweel
+    .replace(/[\u0623\u0625\u0622]/g, "\u0627")                  // أ إ آ -> ا
+    .replace(/\u0649/g, "\u064A")                                // ى -> ي
+    .replace(/\u0629/g, "\u0647")                                // ة -> ه
+    .replace(/[\u0660-\u0669]/g, function(d) { return String(d.charCodeAt(0) - 0x0660); })  // ٠-٩
+    .replace(/[\u06F0-\u06F9]/g, function(d) { return String(d.charCodeAt(0) - 0x06F0); })  // ۰-۹
+    .toLowerCase();
+}
+
+var ORDINALS = {
+  "الاول": 1, "الاولي": 1, "الحادي": 1, "الحاديه": 1,
+  "الثاني": 2, "الثانيه": 2,
+  "الثالث": 3, "الثالثه": 3,
+  "الرابع": 4, "الرابعه": 4,
+  "الخامس": 5, "الخامسه": 5,
+  "السادس": 6, "السادسه": 6,
+  "السابع": 7, "السابعه": 7,
+  "الثامن": 8, "الثامنه": 8,
+  "التاسع": 9, "التاسعه": 9,
+  "العاشر": 10, "العاشره": 10
+};
+var ORD_NAMES = ["", "الاول", "الثاني", "الثالث", "الرابع", "الخامس", "السادس", "السابع", "الثامن", "التاسع", "العاشر"];
+
+// reads "8" / "الثامن" / "الحادي عشر" from the start of s (already arNorm'ed)
+function readNumber(s) {
+  var m = /^\s*(\d{1,3})(?!\d)/.exec(s);
+  if (m) return parseInt(m[1], 10);
+  m = /^\s*([^\s\-:|.,\u060C]+)(\s+عشر[ه]?)?/.exec(s);
+  if (!m) return 0;
+  var base = ORDINALS[m[1]];
+  if (!base) return 0;
+  return m[2] ? 10 + base : base;
+}
+
+function parseSE(title) {
+  var n = arNorm(decodeHtml(title)).replace(/\s+/g, " ");
+  var season = 0, episode = 0, m;
+
+  m = /(?:الموسم|موسم|الجزء|جزء)\s*[:\-]?\s*/.exec(n);
+  if (m) season = readNumber(n.slice(m.index + m[0].length));
+  if (!season && (m = /\bseason\s*0*(\d{1,2})\b/.exec(n))) season = parseInt(m[1], 10);
+
+  m = /(?:الحلقه|حلقه|\bepisode|\bep\b\.?)\s*[:\-]?\s*/.exec(n);
+  if (m) episode = readNumber(n.slice(m.index + m[0].length));
+
+  if (m = /\bs0*(\d{1,2})\s*e0*(\d{1,3})\b/.exec(n)) {   // S08E01
+    if (!season) season = parseInt(m[1], 10);
+    if (!episode) episode = parseInt(m[2], 10);
+  }
+
+  // series name = text before the first season/episode marker, minus "مسلسل" etc.
+  var cut = n.search(/(?:الموسم|موسم|الجزء|جزء|الحلقه|حلقه|\bseason\b|\bepisode\b|\bs\d{1,2}\s*e\d)/);
+  var name = cut > 0 ? n.slice(0, cut) : n;
+  name = name.replace(/^\s*(?:(?:مسلسل|فيلم|مشاهده|تحميل|انمي)\s+)+/, "").replace(/\s+/g, " ").trim();
+
+  // last resort: plain trailing number ("مسلسل X 12"), only when nothing explicit was found
+  if (!season && !episode && (m = /\s(\d{1,3})\s*(?:مترجم\S*|مدبلج\S*|كامل\S*|اون\s*لاين|hd)?\s*$/.exec(n)) && parseInt(m[1], 10) < 1900) {
+    episode = parseInt(m[1], 10);
+    name = name.replace(/\s\d{1,3}\s*$/, "").trim();
+  }
+  return { season: season, episode: episode, name: name };
+}
+
+// Only accept a result whose season AND episode match. No season in the title = season 1.
+function chooseTvResult(results, titles, season, episode) {
+  var wantS = Number(season) || 1;
+  var wantE = Number(episode) || 1;
+  var best = null, bestScore = 0, bestExplicit = false;
+
+  results.forEach(function(r) {
+    var p = parseSE(r.title);
+    if (p.episode !== wantE || (p.season || 1) !== wantS) return;
+    var score = 0;
+    titles.forEach(function(t) {
+      var sc = similarity(arNorm(p.name), arNorm(t));
+      if (sc > score) score = sc;
+    });
+    if (score < 0.4) return;
+    var explicit = p.season === wantS;               // "الموسم 1" beats a title with no season marker
+    if (score > bestScore || (score === bestScore && explicit && !bestExplicit)) {
+      best = r; bestScore = score; bestExplicit = explicit;
+    }
+  });
+
+  if (best) {
+    console.log("[Laroza] Best TV match for S" + wantS + "E" + wantE + ":", best.title, "score:", bestScore.toFixed(3));
+  } else {
+    console.log("[Laroza] No result matches S" + wantS + "E" + wantE + ". Parsed candidates:");
+    results.slice(0, 15).forEach(function(r) {
+      var p = parseSE(r.title);
+      console.log("   S" + (p.season || "?") + " E" + (p.episode || "?") + " <- " + r.title);
+    });
+  }
+  return best;
+}
+
 function getTvStreams(tmdbId, season, episode) {
-  var wanted = Number(episode) || 1;
+  var wantS = Number(season) || 1;
+  var wantE = Number(episode) || 1;
   return getTmdbTitles(tmdbId, "tv").then(function(meta) {
     var searches = [];
     meta.titles.forEach(function(t) {
-      searches.push(t + " الحلقة " + wanted);
-      searches.push(t + " " + wanted);
+      searches.push(t + " الموسم " + wantS + " الحلقة " + wantE);
+      if (ORD_NAMES[wantS]) searches.push(t + " الموسم " + ORD_NAMES[wantS] + " الحلقة " + wantE);
+      searches.push(t + " الحلقة " + wantE);
+      searches.push(t + " " + wantE);
       searches.push(t);
     });
 
@@ -444,15 +545,8 @@ function getTvStreams(tmdbId, season, episode) {
       });
       console.log("[Laroza] Unique TV candidates:", all.length);
 
-      var withEp = all.filter(function(r) {
-        var dec = r.title;
-        return new RegExp("(?:الحلق[ةه]\\s*" + wanted + "\\b|\\b" + wanted + "\\b)", "i").test(dec);
-      });
-      var pool = withEp.length ? withEp : all;
-      console.log("[Laroza] TV candidates with ep " + wanted + ":", withEp.length, "/ pool:", pool.length);
-
-      if (!pool.length) return [];
-      var best = chooseResult(pool, meta.titles);
+      if (!all.length) return [];
+      var best = chooseTvResult(all, meta.titles, wantS, wantE);
       if (!best) return [];
       return resolveVid(best.vid);
     });
