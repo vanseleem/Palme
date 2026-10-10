@@ -1,6 +1,6 @@
 var BASE_URL = 'https://fosta-tv.monster';
 var PROVIDER_ID = 'aravid';
-var PROVIDER_NAME = '🎖️ Aravid';
+var PROVIDER_NAME = 'Aravid';
 
 // Free key from https://www.themoviedb.org/settings/api
 var TMDB_API_KEY = '83d364331c40bfbe29858aeed82f45cc';
