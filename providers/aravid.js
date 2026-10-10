@@ -2,10 +2,17 @@ var BASE_URL = 'https://fosta-tv.vip';
 var PROVIDER_ID = 'aravid';
 var PROVIDER_NAME = 'Aravid';
 
+// Free key from https://www.themoviedb.org/settings/api
 var TMDB_API_KEY = '83d364331c40bfbe29858aeed82f45cc';
 
+// ───────────────────────── Content language filter ─────────────────────
+// 'arabic'  = only Arabic-original content
+// 'english' = only English-original content
+// 'both'    = both Arabic and English content (default)
 var CONTENT_LANG = 'both';
 
+// true  = skip dubbed / subtitled uploads for Arabic content
+//         (zero cross-talk with foreign titles)
 var SKIP_DUB_SUB_ARABIC = true;
 
 var MAX_SEARCH_PAGES = 3;
@@ -18,9 +25,13 @@ var EMBED_TIMEOUT = 12000;
 var UA_SITE = 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Mobile Safari/537.36';
 var UA_EMBED = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
+// ─────────────────────────────── Logging ──────────────────────────────
+
 function log(message) {
   console.log('[FostaTV] ' + message);
 }
+
+// ───────────────────────────── Text helpers ───────────────────────────
 
 function decodeEntities(str) {
   return String(str == null ? '' : str)
@@ -81,6 +92,8 @@ function hasArabicScript(text) {
 function pad2(n) {
   return n < 10 ? '0' + n : String(n);
 }
+
+// ────────────────────────── Title vocabulary ──────────────────────────
 
 var KIND_BY_WORD = {};
 [
@@ -157,6 +170,8 @@ function parseTitle(raw) {
   return info;
 }
 
+// ─────────────────────────── Fuzzy comparison ─────────────────────────
+
 function bigramMap(str) {
   var s = str.replace(/ /g, '');
   var map = {};
@@ -184,6 +199,8 @@ function diceScore(a, b) {
 function numberTokens(str) {
   return (str.match(/\d+/g) || []).join(',');
 }
+
+// ──────────────────────────────── HTTP ────────────────────────────────
 
 function asciiSafe(value) {
   return String(value).replace(/[^\x00-\x7F]/g, function (c) { return encodeURIComponent(c); });
@@ -237,6 +254,8 @@ function absoluteUrl(url, baseUrl) {
   return '';
 }
 
+// ─────────────────────────── HTML extraction ──────────────────────────
+
 function getAttr(tag, name) {
   var m = new RegExp('\\s' + name + '\\s*=\\s*(?:"([^"]*)"|\'([^\']*)\')', 'i').exec(tag);
   return m ? (m[1] !== undefined ? m[1] : m[2]) : '';
@@ -273,6 +292,8 @@ function parseMaxPage(html) {
   while ((m = re.exec(html)) !== null) max = Math.max(max, parseInt(m[1], 10));
   return max;
 }
+
+// ──────────────────────────────── TMDB ────────────────────────────────
 
 function fetchTmdb(tmdbId, type) {
   var url = 'https://api.themoviedb.org/3/' + type + '/' + encodeURIComponent(tmdbId) +
@@ -330,6 +351,8 @@ function buildMeta(data, type) {
   };
 }
 
+// ─────────────────────────────── Search ───────────────────────────────
+
 function searchPage(query, page) {
   var url = BASE_URL + '/search.php?keywords=' + encodeURIComponent(query) + (page > 1 ? '&page=' + page : '');
   return siteGet(url).then(function (html) {
@@ -367,6 +390,8 @@ function searchQueries(queries, onEntries, afterQuery) {
   }
   return nextQuery();
 }
+
+// ─────────────────────────────── Movies ───────────────────────────────
 
 function scoreMovieEntry(entry, meta) {
   var info = parseTitle(entry.title);
@@ -459,6 +484,8 @@ function getMovieStreams(meta, title) {
     return next();
   });
 }
+
+// ─────────────────────────────── Series ───────────────────────────────
 
 function matchSeriesName(name, targets) {
   for (var i = 0; i < targets.length; i++) {
@@ -614,6 +641,8 @@ function getSeriesStreams(meta, season, episode, title) {
   });
 }
 
+// ──────────────────────── Servers (play.php) ──────────────────────────
+
 function fetchEmbedUrls(vid) {
   return siteGet(BASE_URL + '/play.php?vid=' + vid, BASE_URL + '/watch.php?vid=' + vid).then(function (html) {
     var urls = [];
@@ -634,9 +663,9 @@ function fetchEmbedUrls(vid) {
     }
 
     collect(/<iframe\b[^>]*?\ssrc\s*=\s*["']([^"']+)["']/gi);
-    collect(/data-embed-\s*url\s*=\s*["'](https?:\/\/[^"']+)["']/gi);
+    collect(/data-[a-z0-9_-]+\s*=\s*["'](https?:\/\/[^"']+)["']/gi);
 
-    var reHost = /https?:\/\/[^"'\s<>]*(?:1vid|vidmoly|playmogo|uqload|dood|voe|streamtape|filemoon|upstream|mp4upload|sendvid|sibnet|mixdrop|ds2play|vidspeed|ok\.ru|vk\.com|vkvideo|hgcloud|vidhide|listeamed|bysesukior)[^"'\s<>]*/gi;
+    var reHost = /https?:\/\/[^"'\s<>]*(?:1vid|vidmoly|playmogo|uqload|dood|voe|streamtape|filemoon|upstream|mp4upload|sendvid|sibnet|mixdrop|ds2play|vidspeed|ok\.ru|vk\.com|vkvideo|hgcloud|vidhide|listeamed)[^"'\s<>]*/gi;
     collect(reHost);
 
     log('play.php extracted ' + urls.length + ' embed URL(s)');
@@ -665,9 +694,10 @@ function serverLabel(host) {
   if (/mp4upload/.test(host)) return 'MP4Upload';
   if (/sibnet/.test(host)) return 'Sibnet';
   if (/upstream/.test(host)) return 'Upstream';
-  if (/bysesukior/.test(host)) return 'Bysesukior';
   return host.split('.').slice(-2, -1)[0] || host;
 }
+
+// ───────────────────────────── Extractors ─────────────────────────────
 
 var QUALITY_RANK_AUTO = 1080;
 
@@ -720,7 +750,7 @@ function unpackAll(text) {
   return out;
 }
 
-var BAD_ASSET = /\.(?:jpe?g|png|gif|webp|vtt|srt|css|js|json)(?:[?#]|$)/i;
+var BAD_ASSET = /\.(?:jpe?g|png|gif|webp|vtt|srt|css|js|json|html?)(?:[?#]|$)/i;
 
 function scanMediaUrls(text, baseUrl) {
   var patterns = [
@@ -729,15 +759,14 @@ function scanMediaUrls(text, baseUrl) {
     /["']?file["']?\s*:\s*["']([^"']+\.(?:m3u8|mp4)[^"']*)["']/gi,
     /["']hls\d*["']\s*:\s*["']([^"']+)["']/gi,
     /wurl\s*=\s*["']([^"']+)["']/gi,
-    /["'](https?:\\?\/\\?\/[^"'\s]+?\.(?:m3u8|mp4)[^"'\s]*)["']/gi,
-    /https?:\/\/[^"'\s<>\\]+\.(?:m3u8|mp4)[^"'\s<>\\]*/gi
+    /["'](https?:\\?\/\\?\/[^"'\s]+?\.(?:m3u8|mp4)[^"'\s]*)["']/gi
   ];
   var found = [];
   var seen = {};
   patterns.forEach(function (re) {
     var m;
     while ((m = re.exec(text)) !== null) {
-      var url = absoluteUrl(cleanMediaUrl(m[1] !== undefined ? m[1] : m[0]), baseUrl);
+      var url = absoluteUrl(cleanMediaUrl(m[1]), baseUrl);
       if (!url || seen[url] || BAD_ASSET.test(url)) continue;
       seen[url] = true;
       found.push(url);
@@ -831,7 +860,7 @@ function extractOk(embedUrl) {
             if (hls) out.push({ url: cleanMediaUrl(hls), quality: 'Auto', headers: headers });
             if (out.length) return out;
           }
-        } catch (e) { }
+        } catch (e) { /* fall through */ }
       }
 
       var mm = /"hlsManifestUrl"\s*:\s*"([^"]+)"/i.exec(html);
@@ -852,22 +881,19 @@ function resolveEmbed(embedUrl) {
   var job;
   if (/(^|\.)vk\.com$|(^|\.)vkvideo\.ru$/.test(host)) job = extractVk(embedUrl);
   else if (/(^|\.)ok\.ru$/.test(host)) job = extractOk(embedUrl);
-  else if (/dood|playmogo|uqload|ds2play|vidspeed|bysesukior/.test(host)) job = extractDood(embedUrl);
+  else if (/dood|playmogo|uqload|ds2play|vidspeed/.test(host)) job = extractDood(embedUrl);
   else job = extractGeneric(embedUrl);
 
   return job.then(function (items) {
     var label = serverLabel(host);
-    if (!items.length) {
-      log(label + ' no direct stream - using embed fallback');
-      return [{ url: embedUrl, quality: 'Auto', headers: { 'User-Agent': UA_EMBED, 'Referer': BASE_URL + '/' }, server: label }];
-    }
     return items.map(function (it) { it.server = label; return it; });
   }).catch(function (err) {
-    var label = serverLabel(host);
-    log(label + ' failed: ' + (err && err.message) + ' - using embed fallback');
-    return [{ url: embedUrl, quality: 'Auto', headers: { 'User-Agent': UA_EMBED, 'Referer': BASE_URL + '/' }, server: label }];
+    log(serverLabel(host) + ' failed: ' + (err && err.message));
+    return [];
   });
 }
+
+// ─────────────────────────── Stream assembly ──────────────────────────
 
 function qualityRank(q) {
   if (q === 'Auto') return QUALITY_RANK_AUTO;
@@ -883,13 +909,15 @@ function getServerStreams(vid, title) {
     var streams = [];
     var seenServers = {};
     groups.forEach(function (items) {
+      if (streams.length >= MAX_SERVERS) return;
       if (!items.length) return;
+      // Keep only the best quality for this server.
       items.sort(function (a, b) { return qualityRank(b.quality) - qualityRank(a.quality); });
       var best = items[0];
       if (seenServers[best.server]) return;
       seenServers[best.server] = true;
       streams.push({
-        name: PROVIDER_NAME + ' ' + best.server + (best.quality !== 'Unknown' && best.quality !== 'Auto' ? ' ' + best.quality : ''),
+        name: PROVIDER_NAME + ' ' + best.server + (best.quality !== 'Unknown' ? ' ' + best.quality : ''),
         title: title,
         url: best.url,
         quality: best.quality,
@@ -898,11 +926,12 @@ function getServerStreams(vid, title) {
         provider: PROVIDER_ID
       });
     });
-    var limited = streams.slice(0, MAX_SERVERS);
-    log('returning ' + limited.length + ' unique server stream(s) (cap=' + MAX_SERVERS + ')');
-    return limited;
+    log('returning ' + streams.length + ' unique server stream(s)');
+    return streams;
   });
 }
+
+// ───────────────────────────── Entry point ────────────────────────────
 
 function getStreams(tmdbId, mediaType, seasonNum, episodeNum) {
   var type = mediaType === 'tv' || mediaType === 'series' ? 'tv' : 'movie';
