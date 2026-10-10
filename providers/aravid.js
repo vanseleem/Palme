@@ -6,13 +6,7 @@ var PROVIDER_NAME = 'Aravid';
 var TMDB_API_KEY = '83d364331c40bfbe29858aeed82f45cc';
 
 // ───────────────────────── Content language filter ─────────────────────
-// 'arabic'  = only Arabic-original content
-// 'english' = only English-original content
-// 'both'    = both Arabic and English content (default)
 var CONTENT_LANG = 'both';
-
-// true  = skip dubbed / subtitled uploads for Arabic content
-//         (zero cross-talk with foreign titles)
 var SKIP_DUB_SUB_ARABIC = true;
 
 var MAX_SEARCH_PAGES = 3;
@@ -129,7 +123,6 @@ function parseTitle(raw) {
   var info = { kind: null, name: '', year: null, season: null, episode: null, dubbed: false, subbed: false };
   var tokens = normalizeText(raw).split(' ').filter(Boolean);
 
-  // Scan the first few tokens for a kind word; handles "مشاهدة فيلم ..." prefixes.
   var kindIdx = -1;
   for (var k = 0; k < Math.min(tokens.length, 3); k++) {
     if (KIND_BY_WORD[tokens[k]]) { kindIdx = k; break; }
@@ -398,7 +391,6 @@ function scoreMovieEntry(entry, meta) {
   var info = parseTitle(entry.title);
   if (info.kind !== 'movie' && info.kind !== 'play') return null;
 
-  // Only block dubbed/subbed uploads for Arabic-original content.
   if (meta.arabic && SKIP_DUB_SUB_ARABIC && (info.dubbed || info.subbed)) return null;
 
   var yearDiff = meta.year && info.year ? Math.abs(meta.year - info.year) : null;
@@ -511,7 +503,6 @@ function findSeriesEntries(meta, season) {
       var info = parseTitle(entry.title);
       if (info.kind !== 'series' && info.kind !== 'show') return;
       if (info.episode === null) return;
-      // Only block dubbed/subbed uploads for Arabic-original content.
       if (meta.arabic && SKIP_DUB_SUB_ARABIC && (info.dubbed || info.subbed)) return;
       var m = matchSeriesName(info.name, meta.targets);
       if (!m.matched) return;
@@ -905,27 +896,37 @@ function qualityRank(q) {
 
 function getServerStreams(vid, title) {
   return fetchEmbedUrls(vid).then(function (embedUrls) {
-    log('servers for ' + vid + ': ' + embedUrls.length);
-    return Promise.all(embedUrls.map(resolveEmbed));
+    // ★ FIX 1: Limit to MAX_SERVERS (4) to reduce fetch time and avoid duplicate providers.
+    var limitedUrls = embedUrls.slice(0, MAX_SERVERS);
+    log('servers for ' + vid + ': ' + limitedUrls.length + ' (of ' + embedUrls.length + ')');
+    return Promise.all(limitedUrls.map(resolveEmbed));
   }).then(function (groups) {
-    var streams = [];
-    var seen = {};
+    // ★ FIX 2: Pick the best-quality stream from each embed URL (one stream per server).
+    var bestPerServer = [];
     groups.forEach(function (items) {
-      items.forEach(function (it) {
-        if (seen[it.url]) return;
-        seen[it.url] = true;
-        streams.push({
-          name: PROVIDER_NAME + ' ' + it.server + (it.quality !== 'Unknown' ? ' ' + it.quality : ''),
-          title: title,
-          url: it.url,
-          quality: it.quality,
-          size: 'Unknown',
-          headers: it.headers,
-          provider: PROVIDER_ID
-        });
+      if (!items.length) return;
+      items.sort(function (a, b) { return qualityRank(b.quality) - qualityRank(a.quality); });
+      bestPerServer.push(items[0]);
+    });
+
+    // ★ FIX 3: Deduplicate by server name so each provider appears only once.
+    var streams = [];
+    var seenProviders = {};
+    bestPerServer.forEach(function (it) {
+      if (seenProviders[it.server]) return;
+      seenProviders[it.server] = true;
+      streams.push({
+        name: PROVIDER_NAME + ' ' + it.server + (it.quality !== 'Unknown' ? ' ' + it.quality : ''),
+        title: title,
+        url: it.url,
+        quality: it.quality,
+        size: 'Unknown',
+        headers: it.headers,
+        provider: PROVIDER_ID
       });
     });
-    streams.sort(function (a, b) { return qualityRank(b.quality) - qualityRank(a.quality); });
+
+    streams = streams.slice(0, MAX_SERVERS);
     return streams;
   });
 }
