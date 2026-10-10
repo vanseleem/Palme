@@ -1,6 +1,7 @@
 var BASE = "https://akwam.ss";
 var UA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Mobile Safari/537.36";
 var TMDB_API_KEY = "83d364331c40bfbe29858aeed82f45cc";
+var MAX_SERVERS = 4;
 
 function fetchText(url, referer) {
   url = String(url).replace(/[^\x00-\x7F]/g, function(c) {
@@ -201,8 +202,8 @@ function extractSources(html) {
     var qualityMatch = source.match(/\bsize=["']([^"']+)["']/i) || source.match(/\blabel=["']([^"']+)["']/i);
     var quality = qualityMatch ? qualityMatch[1] : "Unknown";
     streams.push({
-      name: "✨ Akwam",
-      title: quality === "Unknown" ? "✨ Akwam" : "✨ Akwam " + quality,
+      name: "Akwam",
+      title: quality === "Unknown" ? "Akwam" : "Akwam " + quality,
       url: url,
       quality: quality
     });
