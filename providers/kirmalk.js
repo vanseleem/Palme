@@ -8,6 +8,10 @@ var MAX_SERVERS = 4;
 var SITE_TIMEOUT = 15000;
 var HOST_TIMEOUT = 15000;
 
+// NEW: these were used but never declared. Set both to false once everything works again.
+var DEBUG = true;
+var DEBUG_STREAM = true;
+
 var UA_SITE = 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Mobile Safari/537.36';
 var UA_HOST = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
@@ -730,6 +734,20 @@ function extractServerButtons(html, pageUrl) {
     .map(function (e) { return e.x; });
 }
 
+// NEW: short description of what a host page contains (goes to the log / debug entry)
+function pageMarkers(html) {
+  var m = [];
+  if (/\/pass_md5\//i.test(html)) m.push('pass_md5');
+  if (/p,a,c,k,e/.test(html)) m.push('packed');
+  if (/\.m3u8/i.test(html)) m.push('m3u8');
+  if (/\.mp4/i.test(html)) m.push('mp4');
+  if (/Embeds? disabled|embedding is disabled/i.test(html)) m.push('embeds-disabled');
+  if (/just a moment|cf-chl|challenge-platform|cf-turnstile/i.test(html)) m.push('cf-challenge');
+  if (/g-recaptcha|h-captcha|hcaptcha|recaptcha/i.test(html)) m.push('captcha');
+  if (/<iframe\b/i.test(html)) m.push('iframe');
+  return m.length ? m.join(',') : 'none';
+}
+
 function resolveHost(hostUrl, referer, depth) {
   log('host: ' + hostUrl);
   var h = hostOf(hostUrl);
@@ -742,6 +760,8 @@ function resolveHost(hostUrl, referer, depth) {
     'Accept': 'text/html,application/xhtml+xml,*/*',
     'Accept-Language': 'ar,en;q=0.9'
   }, HOST_TIMEOUT).then(function (html) {
+    log('host page: ' + html.length + 'b [' + pageMarkers(html) + ']');   // NEW
+
     if (/Embeds disabled|Embed disabled|embedding is disabled/i.test(html)) {
       log('embed disabled by host (referer sent: ' + (depth === 0 ? BASE_URL + '/' : referer) + ') — trying /e/ and /d/');
       var codeMatch = /embed-([a-z0-9]+)\.html/i.exec(hostUrl) || /\/[ed]\/([a-z0-9]+)/i.exec(hostUrl);
@@ -759,7 +779,11 @@ function resolveHost(hostUrl, referer, depth) {
       });
     }
 
-    if (dood) {
+    // CHANGED: a Dood-style page is recognised by its content too, so a rotated domain keeps working
+    var doodPage = dood || /\/pass_md5\/[^"'\s<>]+/i.test(html);
+    if (doodPage && !dood) log('dood-style page on unlisted host ' + h);
+
+    if (doodPage) {
       return doodMediaFromPage(html, hostUrl).then(function (m) {
         log('dood media found: ' + m.length);
         if (m.length) return [{ pageUrl: hostUrl, media: m }];
@@ -1118,10 +1142,11 @@ function tvStreams(meta, S, E) {
 
 function debugStreams(reason) {
   if (!DEBUG_STREAM) return [];
-  var lines = TRACE.slice(-9).map(function (l) { return l.length > 110 ? l.slice(0, 110) + '…' : l; });
+  // CHANGED: 14 lines / 100 chars each / 1400 total (was 9 / 110 / 900) so the first server's lines stay visible
+  var lines = TRACE.slice(-14).map(function (l) { return l.length > 100 ? l.slice(0, 100) + '…' : l; });
   return [{
     name: 'Kirmalk DEBUG',
-    title: ('NO STREAMS (' + reason + ')\n' + lines.join('\n')).slice(0, 900),
+    title: ('NO STREAMS (' + reason + ')\n' + lines.join('\n')).slice(0, 1400),
     url: BASE_URL + '/',
     quality: 'Auto',
     headers: {}
