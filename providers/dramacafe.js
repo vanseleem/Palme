@@ -1,19 +1,16 @@
 /**
- * DramaCafe provider — built from your recon
+ * DramaCafe provider (direct-only edition)
  *
- * Confirmed structure:
- *   Search  : GET /search.php?keywords={q}&video-id=
- *             → HTML with <a href="watch.php?vid=HASH" title="TITLE">
- *   Watch   : GET /watch.php?vid=HASH
- *             → player page + (for series) full episode list
- *   Play    : GET /play.php?vid=HASH
- *             → server list: <li data-embed-id="N" data-embed-url="URL">
- *   Category: GET /category.php?cat={slug}-series-full-episodes
- *             → full episode list
+ * Fixes vs. previous version:
+ *   - cleanMediaUrl decodes \u002F escapes (VK URLs were breaking)
+ *   - extractVk returns HLS master + individual qualities, sorted
+ *   - extractUqload added — real MP4 extraction
+ *   - resolveEmbed returns ONE best-quality link per server (no 6x spam)
+ *   - resolveVid has NO iframe fallback (kills the 95% buffering)
+ *   - servers sorted by reliability priority (VK → Vidspeed → 1vid → Uqload → ...)
  *
- * Servers observed: 1vid, Vk, Hgcloud, Vidspeed, Listeamed, Uqload
- *
- * If BASE stops resolving, update it — this site rotates domains frequently.
+ * Result: only direct .m3u8/.mp4 links reach Nuvio. Dead iframes disappear
+ * instead of showing a spinning tile.
  */
 
 var BASE = "https://ddramacafe-tv.casa";
@@ -94,12 +91,12 @@ function normalizeText(input) {
     s = s.normalize("NFD").replace(/[\u0300-\u036f]/g, "");
   }
   s = s
-    .replace(/[\u064B-\u065F\u0670\u0640]/g, "")           // tashkeel, dagger alef, tatweel
-    .replace(/[\u0622\u0623\u0625\u0671]/g, "\u0627")     // alef variants -> alef
-    .replace(/\u0649/g, "\u064A")                           // alef maqsura -> ya
-    .replace(/\u0629/g, "\u0647")                           // ta marbuta -> ha
-    .replace(/\u0624/g, "\u0648")                           // hamza on waw -> waw
-    .replace(/\u0626/g, "\u064A")                           // hamza on ya -> ya
+    .replace(/[\u064B-\u065F\u0670\u0640]/g, "")
+    .replace(/[\u0622\u0623\u0625\u0671]/g, "\u0627")
+    .replace(/\u0649/g, "\u064A")
+    .replace(/\u0629/g, "\u0647")
+    .replace(/\u0624/g, "\u0648")
+    .replace(/\u0626/g, "\u064A")
     .replace(/\u0686/g, "\u062C")
     .replace(/\u067E/g, "\u0628")
     .replace(/\u06A4/g, "\u0641")
@@ -114,13 +111,11 @@ function pad2(n) { return n < 10 ? "0" + n : String(n); }
 
 var KIND_BY_WORD = {};
 [
-  // Arabic
   ["فيلم", "movie"], ["فلم", "movie"], ["افلام", "movie"], ["أفلام", "movie"],
   ["مسلسل", "series"], ["مسلسلات", "series"],
   ["انمي", "anime"], ["أنمي", "anime"], ["انيمي", "anime"], ["أنيمي", "anime"],
   ["مسرحيه", "play"], ["مسرحية", "play"],
   ["برنامج", "show"], ["برامج", "show"],
-  // English
   ["movie", "movie"], ["film", "movie"],
   ["series", "series"], ["show", "series"],
   ["anime", "anime"]
@@ -159,7 +154,7 @@ var ORDINALS = {};
   ["الأول", 1], ["الاول", 1], ["الأولى", 1], ["الاولى", 1], ["اول", 1], ["أول", 1], ["أولى", 1],
   ["الثاني", 2], ["الثانية", 2], ["ثاني", 2], ["ثانية", 2], ["تانى", 2], ["تانية", 2],
   ["الثالث", 3], ["الثالثة", 3], ["ثالث", 3], ["ثالثة", 3], ["تالت", 3], ["تالتة", 3],
-  ["الرابع", 4], ["الرابعة", 4], ["رابع", 4], ["رابعة", 4], ["رابع", 4],
+  ["الرابع", 4], ["الرابعة", 4], ["رابع", 4], ["رابعة", 4],
   ["الخامس", 5], ["الخامسة", 5], ["خامس", 5], ["خامسة", 5],
   ["السادس", 6], ["السادسة", 6], ["سادس", 6], ["سادسة", 6],
   ["السابع", 7], ["السابعة", 7], ["سابع", 7], ["سابعة", 7],
@@ -183,7 +178,6 @@ function parseTitle(raw) {
   };
   var tokens = normalizeText(raw).split(" ").filter(Boolean);
 
-  // Find kind in first 3 tokens
   var kindIdx = -1;
   for (var k = 0; k < Math.min(tokens.length, 3); k++) {
     if (KIND_BY_WORD[tokens[k]]) { kindIdx = k; break; }
@@ -193,14 +187,12 @@ function parseTitle(raw) {
     tokens.splice(kindIdx, 1);
   }
 
-  // Remove dub / sub markers
   tokens = tokens.filter(function (t) {
     if (DUB_WORDS[t]) { info.dubbed = true; return false; }
     if (SUB_WORDS[t]) { info.subbed = true; return false; }
     return true;
   });
 
-  // Series / anime / show : season + episode
   if (info.kind === "series" || info.kind === "anime" || info.kind === "show") {
     var epIdx = -1;
     for (var e = 0; e < tokens.length; e++) {
@@ -216,7 +208,6 @@ function parseTitle(raw) {
       tokens = tokens.slice(0, epIdx);
     }
 
-    // Season: search backwards for the last season marker
     for (var i = tokens.length - 2; i >= 0; i--) {
       if (SEASON_WORDS[tokens[i]]) {
         var sNum = numberFromToken(tokens[i + 1]);
@@ -228,7 +219,6 @@ function parseTitle(raw) {
       }
     }
   } else {
-    // Movie: last 4-digit 19xx/20xx token is the year
     for (var j = tokens.length - 1; j >= 0; j--) {
       if (/^(19|20)\d\d$/.test(tokens[j])) {
         if (tokens.length > 1) {
@@ -375,7 +365,6 @@ function searchMany(meta, season, episode) {
       if (meta.year) queries.push(t + " " + meta.year);
       queries.push("فيلم " + t);
     } else {
-      // For series we try the exact episode pattern the site uses
       var kindWord = meta.anime ? "انمي" : "مسلسل";
       if (episode) {
         queries.push(t + " الحلقة " + episode);
@@ -478,7 +467,6 @@ function rankCandidates(candidates, meta, season, episode) {
 
 // ═══════════════════════ Episode resolution ═══════════════════════
 
-// Given a series watch page, look through its episode list for the right S/E.
 function findEpisodeVid(watchUrl, meta, season, episode) {
   return fetchText(watchUrl, BASE + "/").then(function (html) {
     var anchors = parseWatchAnchors(html);
@@ -491,26 +479,22 @@ function findEpisodeVid(watchUrl, meta, season, episode) {
       var parsed = parseTitle(a.title);
       var s = 0;
 
-      // Must be a series / anime kind
       if (parsed.kind && parsed.kind !== "series" && parsed.kind !== "anime" && parsed.kind !== "show") return;
 
-      // Episode
       if (episode) {
         if (parsed.episode === episode) s += 10;
         else if (parsed.episode !== null) return;
       }
 
-      // Season
       if (season > 1) {
         if (parsed.season === season) s += 5;
         else if (parsed.season !== null && parsed.season !== season) return;
-        else if (parsed.season === null) return;   // skip null-season entries when a specific season is wanted
+        else if (parsed.season === null) return;
       } else {
         if (parsed.season === 1 || parsed.season === null) s += 2;
         else return;
       }
 
-      // Name match (loose)
       var nameOk = false;
       meta.targets.forEach(function (t) {
         if (parsed.name === t) { nameOk = true; s += 5; }
@@ -549,7 +533,6 @@ function parseServersFromPlayPage(html) {
     out.push({ url: url, number: num || (out.length + 1), label: label || "" });
   }
 
-  // Match every <li> that carries a data-embed-url
   var liRe = /<li\b([^>]*data-embed-url[^>]*)>([\s\S]{0,600}?)<\/li>/gi;
   var m;
   while ((m = liRe.exec(html)) !== null) {
@@ -566,19 +549,16 @@ function parseServersFromPlayPage(html) {
     add(urlM[1], idM ? parseInt(idM[1], 10) : 0, label);
   }
 
-  // Fallback 1: any data-embed-url anywhere
   if (!out.length) {
     var reAny = /data-embed-url\s*=\s*["']([^"']+)["']/gi;
     while ((m = reAny.exec(html)) !== null) add(m[1]);
   }
 
-  // Fallback 2: iframe src inside #Playerholder
   if (!out.length) {
     var phM = /id=["']Playerholder["'][\s\S]{0,800}?<iframe[^>]*\ssrc\s*=\s*["']([^"']+)["']/i.exec(html);
     if (phM) add(phM[1], 1, "default");
   }
 
-  // Fallback 3: any iframe in the page
   if (!out.length) {
     var ifRe = /<iframe\b[^>]*\ssrc\s*=\s*["']([^"']+)["']/gi;
     while ((m = ifRe.exec(html)) !== null) add(m[1]);
@@ -588,7 +568,7 @@ function parseServersFromPlayPage(html) {
   return out;
 }
 
-// ═══════════════════════ Embed extractors ═══════════════════════
+// ═══════════════════════ Helpers ═══════════════════════
 
 function hostOf(url) {
   var m = /^https?:\/\/([^\/?#:]+)/i.exec(url);
@@ -637,8 +617,14 @@ function serverLabelFromUrl(url, fallback) {
   return fallback || (h.split(".").slice(-2, -1)[0] || h);
 }
 
+// ─── FIXED cleanMediaUrl (decodes \u002F and \u0026) ───
 function cleanMediaUrl(url) {
-  return String(url).replace(/\\u0026/gi, "&").replace(/\\\//g, "/").replace(/&amp;/g, "&").trim();
+  return String(url)
+    .replace(/\\u0026/gi, "&")
+    .replace(/\\u002F/gi, "/")
+    .replace(/\\\//g, "/")
+    .replace(/&amp;/g, "&")
+    .trim();
 }
 
 function unpackPacker(text) {
@@ -696,23 +682,46 @@ function scanMediaUrls(text, baseUrl) {
   return found;
 }
 
+// ═══════════════════════ Extractors ═══════════════════════
+
+// ─── VK: HLS master + individual qualities, sorted ───
 function extractVk(embedUrl) {
-  return fetchText(embedUrl, BASE + "/", EMBED_TIMEOUT).then(function (html) {
-    var headers = { "User-Agent": UA, "Referer": "https://vk.com/" };
+  return fetchText(embedUrl, "https://vk.com/", EMBED_TIMEOUT).then(function (html) {
+    var headers = {
+      "User-Agent": UA,
+      "Referer": "https://vk.com/",
+      "Origin": "https://vk.com"
+    };
     var out = [];
-    var m;
+    var seen = {};
+
+    function add(url, quality) {
+      url = cleanMediaUrl(url);
+      if (!url || url.indexOf("http") !== 0) return;
+      if (seen[url]) return;
+      seen[url] = 1;
+      out.push({ url: url, quality: quality, headers: headers });
+    }
+
+    // HLS master (single URL that covers all qualities)
+    var hls = /"hls"\s*:\s*"(https?:[^"]+)"/.exec(html);
+    if (hls) add(hls[1], "Auto");
+
+    // Individual MP4 qualities
     var re = /"url(\d{3,4})"\s*:\s*"(https?:[^"]+)"/g;
-    while ((m = re.exec(html)) !== null) {
-      out.push({ url: cleanMediaUrl(m[2]), quality: m[1] + "p", headers: headers });
-    }
-    if (!out.length) {
-      var hls = /"hls"\s*:\s*"(https?:[^"]+)"/.exec(html);
-      if (hls) out.push({ url: cleanMediaUrl(hls[1]), quality: "Auto", headers: headers });
-    }
+    var m;
+    while ((m = re.exec(html)) !== null) add(m[2], m[1] + "p");
+
+    // <source src="...">
+    var srcRe = /<source\s+src=["']([^"']+\.(?:mp4|m3u8)[^"']*)["']/gi;
+    while ((m = srcRe.exec(html)) !== null) add(m[1], qualityFromUrl(m[1]));
+
+    out.sort(function (a, b) { return qualityRank(b.quality) - qualityRank(a.quality); });
     return out;
   });
 }
 
+// ─── OK.ru ───
 var OK_QUALITY = { mobile: "144p", lowest: "240p", low: "360p", sd: "480p", hd: "720p", full: "1080p", quad: "1440p", ultra: "2160p" };
 function extractOk(embedUrl) {
   return fetchText(embedUrl, BASE + "/", EMBED_TIMEOUT).then(function (html) {
@@ -735,6 +744,47 @@ function extractOk(embedUrl) {
   });
 }
 
+// ─── NEW: Uqload direct MP4 ───
+function extractUqload(embedUrl) {
+  return fetchText(embedUrl, BASE + "/", EMBED_TIMEOUT).then(function (html) {
+    var origin = originOf(embedUrl);
+    var headers = {
+      "User-Agent": UA,
+      "Referer": embedUrl,
+      "Origin": origin,
+      "Accept": "*/*"
+    };
+    var out = [];
+
+    // Pattern 1: sources: [{file: "https://...mp4"}]
+    var m = /sources\s*:\s*\[\s*\{\s*["']?file["']?\s*:\s*["']([^"']+)["']/i.exec(html);
+    if (m) {
+      out.push({ url: cleanMediaUrl(m[1]), quality: "Auto", headers: headers });
+      return out;
+    }
+
+    // Pattern 2: <source src="....mp4">
+    var srcM = /<source\s+src=["']([^"']+\.(?:mp4|m3u8)[^"']*)["']/i.exec(html);
+    if (srcM) {
+      out.push({ url: cleanMediaUrl(srcM[1]), quality: qualityFromUrl(srcM[1]), headers: headers });
+      return out;
+    }
+
+    // Pattern 3: packer + scan
+    var texts = [html].concat(unpackPacker(html));
+    var seen = {};
+    texts.forEach(function (t) {
+      scanMediaUrls(t, embedUrl).forEach(function (u) {
+        if (seen[u]) return;
+        seen[u] = 1;
+        out.push({ url: u, quality: qualityFromUrl(u), headers: headers });
+      });
+    });
+    return out;
+  });
+}
+
+// ─── Generic (packer + media scan) ───
 function extractGeneric(embedUrl) {
   return fetchText(embedUrl, BASE + "/", EMBED_TIMEOUT).then(function (html) {
     var texts = [html].concat(unpackPacker(html));
@@ -753,15 +803,22 @@ function extractGeneric(embedUrl) {
   });
 }
 
+// ─── Dispatcher: returns ONLY the best quality from this server ───
 function resolveEmbed(embedUrl, label) {
   var host = hostOf(embedUrl);
   var job;
+
   if (/(^|\.)vk\.com$|vkvideo\.ru$/.test(host)) job = extractVk(embedUrl);
   else if (/(^|\.)ok\.ru$/.test(host)) job = extractOk(embedUrl);
+  else if (/uqload/.test(host)) job = extractUqload(embedUrl);
   else job = extractGeneric(embedUrl);
 
   return job.then(function (items) {
-    return items.map(function (it) { it.server = label; return it; });
+    if (!items.length) return [];
+    items.sort(function (a, b) { return qualityRank(b.quality) - qualityRank(a.quality); });
+    var best = items[0];
+    best.server = label;
+    return [best];
   }).catch(function (e) {
     log("embed fail (" + label + "): " + (e && e.message));
     return [];
@@ -769,6 +826,17 @@ function resolveEmbed(embedUrl, label) {
 }
 
 // ═══════════════════════ Resolve ═══════════════════════
+
+// Reliability priority — most likely to yield a direct stream first
+var SERVER_PRIORITY = ["vk", "vidspeed", "1vid", "uqload", "hgcloud", "listeamed"];
+
+function serverPriority(label) {
+  var l = String(label || "").toLowerCase();
+  for (var i = 0; i < SERVER_PRIORITY.length; i++) {
+    if (l.indexOf(SERVER_PRIORITY[i]) !== -1) return i;
+  }
+  return 999;
+}
 
 function resolveVid(vid, displayTitle) {
   var playUrl = BASE + "/play.php?vid=" + vid;
@@ -778,52 +846,46 @@ function resolveVid(vid, displayTitle) {
   return fetchText(playUrl, BASE + "/").then(function (html) {
     var servers = parseServersFromPlayPage(html);
     if (servers.length) return servers;
-
-    // Fallback: check watch.php for servers
     log("play.php had none - trying watch.php");
     return fetchText(watchUrl, BASE + "/").then(function (h2) {
       return parseServersFromPlayPage(h2);
     });
   }).then(function (servers) {
-    if (!servers.length) {
-      log("no servers available");
-      return [];
-    }
+    if (!servers.length) { log("no servers available"); return []; }
 
+    // Sort by reliability priority
+    servers.sort(function (a, b) {
+      return serverPriority(a.label) - serverPriority(b.label);
+    });
+
+    // Resolve each server. Each contributes ONE best-quality link (or nothing).
     return Promise.all(servers.map(function (srv) {
       var label = srv.label || serverLabelFromUrl(srv.url, "Server " + srv.number);
-      return resolveEmbed(srv.url, label).then(function (items) {
-        if (items.length) return items;
-        // Fallback: return embed as iframe
-        var origin = originOf(srv.url);
-        return [{
-          url: srv.url,
-          quality: "Auto",
-          isIframe: true,
-          headers: { "User-Agent": UA, "Referer": origin + "/", "Origin": origin },
-          server: label
-        }];
-      });
+      return resolveEmbed(srv.url, label);
     })).then(function (groups) {
-      var out = [], seen = {};
+      var out = [];
+      var seen = {};
+
       groups.forEach(function (g) {
         g.forEach(function (it) {
           if (seen[it.url]) return;
           seen[it.url] = 1;
+          var q = it.quality || "Auto";
           out.push({
-            name: PROVIDER_NAME + " " + it.server + (it.quality !== "Auto" ? " " + it.quality : ""),
-            title: displayTitle + " • " + it.server + (it.quality !== "Auto" ? " " + it.quality : ""),
+            name: PROVIDER_NAME + " " + it.server + (q !== "Auto" ? " " + q : ""),
+            title: displayTitle + " • " + it.server + (q !== "Auto" ? " " + q : ""),
             url: it.url,
-            quality: it.quality || "Auto",
+            quality: q,
             size: "Unknown",
-            type: it.isIframe ? "iframe" : (/\.m3u8/i.test(it.url) ? "hls" : "mp4"),
+            type: /\.m3u8/i.test(it.url) ? "hls" : "mp4",
             headers: it.headers,
             provider: PROVIDER_ID
           });
         });
       });
+
       out.sort(function (a, b) { return qualityRank(b.quality) - qualityRank(a.quality); });
-      log("total streams: " + out.length);
+      log("total streams (direct only, one per server): " + out.length);
       return out;
     });
   });
@@ -863,9 +925,6 @@ function getTvStreams(meta, season, episode, displayTitle) {
     var ranked = rankCandidates(candidates, meta, season, episode);
     if (!ranked.length) return [];
 
-    // Strategy: For each top candidate (up to MAX), if the candidate's title
-    // already has the exact S/E, resolve directly. Otherwise, open its watch
-    // page and search the episode list.
     var tried = {};
     var i = 0;
 
@@ -875,7 +934,7 @@ function getTvStreams(meta, season, episode, displayTitle) {
       if (tried[cand.entry.vid]) return tryNext();
       tried[cand.entry.vid] = 1;
 
-      // Direct hit?
+      // Direct hit: the search result itself is the right episode
       if (cand.parsed.episode === episode &&
           (season === 1 ? (cand.parsed.season === 1 || cand.parsed.season === null)
                         : cand.parsed.season === season)) {
@@ -884,7 +943,7 @@ function getTvStreams(meta, season, episode, displayTitle) {
         });
       }
 
-      // Otherwise: fetch the watch page and pick the right episode from the list
+      // Otherwise: get the episode list from the watch page
       return findEpisodeVid(cand.entry.url, meta, season, episode).then(function (epVid) {
         if (!epVid || tried[epVid]) return tryNext();
         tried[epVid] = 1;
