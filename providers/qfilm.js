@@ -1,6 +1,7 @@
 var BASE = "https://a.qfilm.tv";
 var UA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Mobile Safari/537.36";
 var TMDB_API_KEY = "83d364331c40bfbe29858aeed82f45cc";
+var MAX_SERVERS = 4;
 var MIRROR_TIMEOUT = 15000;
 var BAD_HOST = /(^|\.)(qfilm\.tv|facebook\.com|twitter\.com|google\.com|googleapis\.com|gstatic\.com|w3\.org|schema\.org|cloudflare\.com|jquery\.com|jsdelivr\.net|t\.me|telegram\.org|themoviedb\.org)$/i;
 
@@ -359,8 +360,8 @@ function makeStream(url, label, playerUrl) {
   }
 
   return {
-    name: "🎖️ QFilm",
-    title: label ? "🎖️ QFilm \u2022 " + label : "🧿 QFilm",
+    name: "QFilm",
+    title: label ? "QFilm \u2022 " + label : "QFilm",
     url: url,
     quality: qualityFromUrl(url),
     referer: streamReferer,
