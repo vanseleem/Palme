@@ -1,3 +1,8 @@
+/**
+ * Q-Drama Provider for Nuvio
+ * Arabic movies and TV series from vod.q-drama.com
+ * Fixed version — search + episode lookup + fallback server parsing
+ */
 
 var PROVIDER_ID = "qdrama";
 var PROVIDER_NAME = "QDrama";
@@ -53,10 +58,12 @@ function getPage(url, referer) {
     var h = {
         "User-Agent": UA,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "ar,en-US;q=0.7,en;q=0.3"
+        "Accept-Language": "ar,en-US;q=0.7,en;q=0.3",
+        "Referer": referer || (BASE_URL + "/")
     };
-    if (referer) h["Referer"] = referer;
+    log("→ " + url);
     return request(url, h).then(function (r) {
+        log("← " + r.status + " len=" + r.text.length + " final=" + r.url);
         if (!r.ok) throw new Error("HTTP " + r.status);
         return r;
     });
@@ -108,10 +115,6 @@ var ARABIC_RE = /[\u0600-\u06FF]/;
 function hasArabic(s) { return ARABIC_RE.test(String(s || "")); }
 function hasLatin(s) { return /[A-Za-z]/.test(String(s || "")); }
 
-/**
- * Normalize Arabic text only — leaves Latin text untouched.
- * Handles: أ إ آ → ا, ى → ي, ة → ه, removes tashkeel, collapses whitespace.
- */
 function normalizeTitle(s) {
     s = String(s || "").trim();
     if (!s) return "";
@@ -122,8 +125,8 @@ function normalizeTitle(s) {
             .replace(/ؤ/g, "و")
             .replace(/ئ/g, "ي")
             .replace(/ة/g, "ه")
-            .replace(/[\u064B-\u0652\u0670]/g, "") // tashkeel
-            .replace(/\u0640/g, ""); // tatweel
+            .replace(/[\u064B-\u0652\u0670]/g, "")
+            .replace(/\u0640/g, "");
     }
     if (hasLatin(s)) {
         s = s.toLowerCase()
@@ -133,9 +136,6 @@ function normalizeTitle(s) {
     return s.replace(/\s+/g, " ").trim();
 }
 
-/**
- * Score how well a search result matches a target title.
- */
 function similarity(a, b) {
     a = normalizeTitle(a);
     b = normalizeTitle(b);
@@ -203,42 +203,32 @@ function searchQDrama(query) {
     return getPage(url).then(function (r) {
         var html = r.text;
         var results = [];
-        var m, re;
+        var m;
 
-        // Pattern: <a href="...watch.php?vid=XXX" title="TITLE">
-        re = /<a\s+href="[^"]*watch\.php\?vid=([a-f0-9]+)"\s+title="([^"]*)"/gi;
+        log("SEARCH watch.php hits: " + (html.match(/watch\.php/g) || []).length);
+
+        // Robust: any anchor whose href contains watch.php?vid=
+        var re = /<a\b[^>]*href\s*=\s*["']([^"']*watch\.php\?vid=[^"']+)["'][^>]*>/gi;
         while ((m = re.exec(html))) {
-            var title = stripHtml(m[2]);
-            if (title.length < 2) continue;
-            results.push({ vid: m[1], title: title, url: BASE_URL + "/watch.php?vid=" + m[1] });
-        }
-
-        // Pattern: <h3 class="caption">TITLE</h3> (with preceding href)
-        if (!results.length) {
-            re = /<a[^>]*href="[^"]*watch\.php\?vid=([a-f0-9]+)"[^>]*>[\s\S]*?<h3[^>]*>([\s\S]*?)<\/h3>/gi;
-            while ((m = re.exec(html))) {
-                var t = stripHtml(m[2]);
-                if (t.length > 2) {
-                    results.push({ vid: m[1], title: t, url: BASE_URL + "/watch.php?vid=" + m[1] });
-                }
+            var href = m[1];
+            var vidM = /vid=([A-Za-z0-9]+)/i.exec(href);
+            if (!vidM) continue;
+            var titleM = /title\s*=\s*["']([^"']*)["']/i.exec(m[0]);
+            var title = titleM ? stripHtml(titleM[1]) : "";
+            if (!title) {
+                var tail = html.substring(m.index, m.index + 600);
+                var h3 = /<h3[^>]*>([\s\S]*?)<\/h3>/i.exec(tail);
+                if (h3) title = stripHtml(h3[1]);
             }
-        }
-
-        // Fallback: any anchor with vid
-        if (!results.length) {
-            re = /watch\.php\?vid=([a-f0-9]+)[^>]*>([^<]{3,})</gi;
-            while ((m = re.exec(html))) {
-                var t2 = stripHtml(m[2]);
-                if (t2.length > 2) {
-                    results.push({ vid: m[1], title: t2, url: BASE_URL + "/watch.php?vid=" + m[1] });
-                }
-            }
+            if (!title || title.length < 2) continue;
+            var full = absUrl(BASE_URL, href);
+            results.push({ vid: vidM[1], title: title, url: full });
         }
 
         log("SEARCH '" + query + "' → " + results.length + " results");
         return uniq(results);
     }).catch(function (e) {
-        log("SEARCH failed: " + e.message);
+        log("SEARCH ERROR: " + (e && e.message));
         return [];
     });
 }
@@ -261,25 +251,20 @@ function buildSearchQueries(titles, year, type, season, episode) {
         if (!title) return;
         var isAr = hasArabic(title);
 
-        // Base title
         push(title);
-
-        // Title + year
         if (year) push(title + " " + year);
 
-        // Arabic-specific patterns
         if (isAr) {
             push(title.replace(/^(فيلم|مسلسل|مسلسلة)\s+/i, ""));
             if (type === "movie" && !/^فيلم/.test(title)) push("فيلم " + title);
             if (type === "tv" && !/^مسلسل/.test(title)) push("مسلسل " + title);
         }
 
-        // For TV, add season/episode specific queries
         if (type === "tv") {
             var s = parseInt(season, 10) || 1;
             var e = parseInt(episode, 10) || 1;
-            push(title + " الموسم " + s + " الحلقة " + e);
             push(title + " الحلقة " + e);
+            push(title + " الموسم " + s + " الحلقة " + e);
             push(title + " S" + pad2(s) + "E" + pad2(e));
         }
     });
@@ -301,29 +286,21 @@ function pickBest(results, titles, year, type, season, episode) {
             if (s > best) best = s;
         });
 
-        // Year boost
         if (year && String(r.title).indexOf(String(year)) !== -1) best += 20;
-
-        // Type keyword boost
         if (type === "movie" && /فيلم|movie/i.test(r.title)) best += 5;
         if (type === "tv" && /مسلسل|series|season/i.test(r.title)) best += 5;
 
-        // For TV: season/episode matching
         if (type === "tv") {
             var s = parseInt(season, 10) || 1;
             var e = parseInt(episode, 10) || 1;
             var t = normalizeTitle(r.title);
 
-            // Season match
             if (t.indexOf("الموسم " + s) !== -1 || t.indexOf("موسم " + s) !== -1) best += 30;
-            else if (s === 1 && t.indexOf("الموسم") === -1) best += 10; // S1 may be unlabeled
+            else if (s === 1 && t.indexOf("الموسم") === -1) best += 10;
 
-            // Episode match — Arabic numerals and digits
             var epPatterns = [
-                String(e), pad2(e),
                 "الحلقة " + e, "الحلقه " + e,
-                "الحلقة " + pad2(e), "الحلقه " + pad2(e),
-                "e" + pad2(e), "E" + pad2(e)
+                "الحلقة " + pad2(e), "الحلقه " + pad2(e)
             ];
             var epFound = false;
             epPatterns.forEach(function (p) {
@@ -331,7 +308,6 @@ function pickBest(results, titles, year, type, season, episode) {
             });
             if (epFound) best += 50;
 
-            // Penalize "كامل" (full series upload) for TV
             if (/كامل|جميع الحلقات/.test(t)) best -= 25;
         }
 
@@ -344,79 +320,75 @@ function pickBest(results, titles, year, type, season, episode) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// EPISODE FINDER (from AiredEPS list on watch page)
+// EPISODE LOOKUP VIA SEARCH
+// Q-Drama does NOT expose an episode list on watch pages.
+// The only reliable path is searching for the episode title.
 // ─────────────────────────────────────────────────────────────
-function findEpisodeFromList(html, season, episode) {
-    var s = parseInt(season, 10) || 1;
+function findEpisodeViaSearch(baseTitle, season, episode) {
     var e = parseInt(episode, 10) || 1;
-    var m;
+    var s = parseInt(season, 10) || 1;
 
-    // Look for AiredEPS section with <a href="watch.php?vid=XXX"><span>الحلقة</span><em>N</em>
-    var re = /<a\s+href="([^"]*watch\.php\?vid=[a-f0-9]+)"[^>]*>\s*<span>الحلقة<\/span><em>(\d+)<\/em>/gi;
-    while ((m = re.exec(html))) {
-        var epNum = parseInt(m[2], 10);
-        if (epNum === e) {
-            var url = m[1];
-            if (!/^https?:\/\//i.test(url)) url = absUrl(BASE_URL, url);
-            log("EPISODE found in list: " + url);
-            return url;
-        }
-    }
+    var queries = [
+        baseTitle + " الحلقة " + e,
+        baseTitle + " الحلقه " + e,
+        baseTitle + " الموسم " + s + " الحلقة " + e
+    ];
 
-    // Alternative: <a href="watch.php?vid=XXX">...الحلقة N...</a>
-    re = /<a\s+href="([^"]*watch\.php\?vid=[a-f0-9]+)"[^>]*>[\s\S]*?الحلقة\s*(\d+)[\s\S]*?<\/a>/gi;
-    while ((m = re.exec(html))) {
-        var epNum2 = parseInt(m[2], 10);
-        if (epNum2 === e) {
-            var url2 = m[1];
-            if (!/^https?:\/\//i.test(url2)) url2 = absUrl(BASE_URL, url2);
-            log("EPISODE found (alt): " + url2);
-            return url2;
-        }
-    }
+    var seen = {}, plan = [];
+    queries.forEach(function (q) { if (!seen[q]) { seen[q] = true; plan.push(q); } });
 
-    return null;
+    var chain = Promise.resolve(null);
+    plan.forEach(function (q) {
+        chain = chain.then(function (found) {
+            if (found) return found;
+            return searchQDrama(q).then(function (results) {
+                if (!results.length) return null;
+                for (var i = 0; i < results.length; i++) {
+                    var t = results[i].title;
+                    var norm = normalizeTitle(t);
+                    if (norm.indexOf("الحلقه " + e) !== -1 ||
+                        norm.indexOf("الحلقة " + e) !== -1) {
+                        log("EPISODE match: " + t);
+                        return results[i];
+                    }
+                }
+                return null;
+            });
+        });
+    });
+    return chain;
 }
 
 // ─────────────────────────────────────────────────────────────
 // EXTRACT VIDEO SOURCES FROM EMBED PAGE
 // ─────────────────────────────────────────────────────────────
-var SKIP_RE = /\.(?:js|css|png|jpe?g|gif|svg|webp|ico|woff2?|ttf|json|xml)(?:\?|#|$)|^(?:about|javascript|data|mailto|blob):/i;
-var AD_HOST_RE = /google|doubleclick|facebook|twitter|disqus|histats|statcounter|cdn-cgi|gstatic|jquery|bootstrapcdn/i;
-
 function collectStreams(text, base) {
     var streams = [];
     var m, re;
 
-    // Absolute m3u8
     (text.match(/https?:\/\/[^\s"'<>\\()\[\]]+?\.m3u8[^\s"'<>\\()\[\],]*/gi) || []).forEach(function (u) {
         streams.push(u);
     });
 
-    // Relative m3u8 in JS configs
     re = /(?:file|src|source|url|hls\w*|stream\w*)["']?\s*[:=]\s*["']((?:\.{0,2}\/)?[^"'\s]+?\.m3u8[^"'\s]*)["']/gi;
     while ((m = re.exec(text))) {
         streams.push(absUrl(base, m[1]));
     }
 
-    // Absolute mp4
     (text.match(/https?:\/\/[^\s"'<>\\()\[\]]+?\.mp4[^\s"'<>\\()\[\],]*/gi) || []).forEach(function (u) {
         streams.push(u);
     });
 
-    // Relative mp4
     re = /(?:file|src|source|url)["']?\s*[:=]\s*["']((?:\.{0,2}\/)?[^"'\s]+?\.mp4[^"'\s]*)["']/gi;
     while ((m = re.exec(text))) {
         streams.push(absUrl(base, m[1]));
     }
 
-    // "sources":[{file:"..."}]
     re = /sources\s*:\s*\[\s*\{[^}]*?file\s*:\s*["']([^"']+)["']/gi;
     while ((m = re.exec(text))) {
         streams.push(absUrl(base, m[1]));
     }
 
-    // "file":"..."
     re = /["']?file["']?\s*:\s*["']([^"']+\.(?:mp4|m3u8)[^"']*)["']/gi;
     while ((m = re.exec(text))) {
         streams.push(absUrl(base, m[1]));
@@ -442,9 +414,6 @@ function collectSubtitles(text, base) {
     return uniq(subs);
 }
 
-/**
- * Extract streams from a single embed server
- */
 function extractFromServer(serverUrl, referer) {
     log("EXTRACT: " + serverUrl);
 
@@ -456,12 +425,10 @@ function extractFromServer(serverUrl, referer) {
     }).then(function (r) {
         var html = r.text;
 
-        // Try unpacking packed JS
         var variants = [html];
         var packed = unpackAll(html);
         variants = variants.concat(packed);
 
-        // Try base64 decoded strings
         var b64Matches = html.match(/atob\(\s*["']([A-Za-z0-9+\/=_\-]{20,})["']\s*\)/g) || [];
         b64Matches.forEach(function (m) {
             var b64 = /atob\(\s*["']([A-Za-z0-9+\/=_\-]{20,})["']\s*\)/.exec(m);
@@ -524,7 +491,6 @@ function parseEmbedServers(html) {
     var servers = [];
     var m;
 
-    // <select id="server-select"> with <option value="URL">سيرفر N</option>
     var re = /<option\s+value="([^"]+)"[^>]*>\s*([^<]+)\s*<\/option>/gi;
     while ((m = re.exec(html))) {
         var name = stripHtml(m[2]).trim();
@@ -534,7 +500,6 @@ function parseEmbedServers(html) {
         }
     }
 
-    // Fallback: iframe src
     if (!servers.length) {
         re = /<iframe[^>]+src="([^"]+)"/i;
         m = re.exec(html);
@@ -566,60 +531,57 @@ function getStreamsFor(tmdbId, type, season, episode, titles, year) {
     var displayTitle = (titles[0] || ("TMDB " + tmdbId)) +
         (type === "tv" ? " S" + pad2(season) + "E" + pad2(episode) : "");
 
-    // Build search queries
     var queries = buildSearchQueries(titles, year, type, season, episode);
-    log("Query plan (" + queries.length + "): " + queries.slice(0, 5).join(" | "));
+    log("Query plan: " + queries.slice(0, 6).join(" | "));
 
-    // Execute searches (cap at 6 to avoid hammering)
     var chain = Promise.resolve([]);
     queries.slice(0, 6).forEach(function (q) {
         chain = chain.then(function (acc) {
-            return searchQDrama(q).then(function (r) {
-                return acc.concat(r);
-            });
+            return searchQDrama(q).then(function (r) { return acc.concat(r); });
         });
     });
 
     return chain.then(function (allResults) {
         var unique = uniq(allResults);
-        log("Total unique results: " + unique.length);
-
+        log("Total unique: " + unique.length);
         var best = pickBest(unique, titles, year, type, season, episode);
-        if (!best) {
-            log("No confident match found");
-            return [];
-        }
+        if (!best) { log("No confident match"); return []; }
 
-        // For TV, try to find the exact episode from the watch page's AiredEPS list
         if (type === "tv") {
-            return getPage(best.url, BASE_URL + "/").then(function (r) {
-                var epUrl = findEpisodeFromList(r.text, season, episode);
-                if (epUrl) {
-                    log("Using episode from list: " + epUrl);
-                    return epUrl;
-                }
-                log("Episode not in list, using best match page: " + best.url);
+            var baseTitle = (titles[0] || best.title).replace(/^(مسلسل|فيلم)\s+/i, "").trim();
+            return findEpisodeViaSearch(baseTitle, season, episode).then(function (ep) {
+                if (ep) { log("Using episode page: " + ep.url); return ep.url; }
+                log("Episode search failed, falling back to best: " + best.url);
                 return best.url;
             });
         }
-
         return best.url;
     }).then(function (playUrl) {
         if (!playUrl) return [];
-        log("PLAY URL: " + playUrl);
+        log("PLAY: " + playUrl);
 
-        // Extract vid from URL
-        var vidMatch = /vid=([a-f0-9]+)/i.exec(playUrl);
-        if (!vidMatch) { log("No vid found in URL"); return []; }
+        var vidMatch = /vid=([A-Za-z0-9]+)/i.exec(playUrl);
+        if (!vidMatch) { log("No vid in URL"); return []; }
         var vid = vidMatch[1];
 
-        // Fetch the embed page (contains all servers)
         var embedUrl = BASE_URL + "/embed.php?vid=" + vid;
-        return getPage(embedUrl, playUrl).then(function (r) {
-            var servers = parseEmbedServers(r.text);
-            if (!servers.length) { log("No servers found"); return []; }
+        return Promise.all([
+            getPage(embedUrl, playUrl).catch(function (e) { log("embed fetch fail: " + e.message); return { text: "" }; }),
+            getPage(playUrl, BASE_URL + "/").catch(function (e) { log("watch fetch fail: " + e.message); return { text: "" }; })
+        ]).then(function (pages) {
+            var servers = parseEmbedServers(pages[0].text);
+            log("Servers from embed.php: " + servers.length);
 
-            // Extract from all servers in parallel
+            if (!servers.length) {
+                var cm = /<meta\s+itemprop="contentUrl"\s+content="([^"]+)"/i.exec(pages[1].text);
+                if (cm && /^https?:\/\//i.test(cm[1])) {
+                    servers.push({ name: "سيرفر 1", url: cm[1] });
+                    log("Fallback server: " + cm[1]);
+                }
+            }
+
+            if (!servers.length) { log("No servers at all"); return []; }
+
             return Promise.all(servers.map(function (srv) {
                 return extractFromServer(srv.url, playUrl).then(function (res) {
                     return { server: srv.name, streams: res.streams, subs: res.subs };
@@ -632,8 +594,7 @@ function getStreamsFor(tmdbId, type, season, episode, titles, year) {
                         if (seen[url]) return;
                         seen[url] = true;
                         out.push({
-                            url: url,
-                            server: g.server,
+                            url: url, server: g.server,
                             quality: detectQuality(url),
                             type: /\.m3u8/i.test(url) ? "hls" : "mp4"
                         });
@@ -641,8 +602,8 @@ function getStreamsFor(tmdbId, type, season, episode, titles, year) {
                 });
                 out.sort(function (a, b) { return b.quality - a.quality; });
                 allSubs = uniq(allSubs);
-
                 log("TOTAL: " + out.length + " streams, " + allSubs.length + " subs");
+
                 return out.map(function (s) {
                     return {
                         name: PROVIDER_NAME + " - " + s.server + " (" + s.type.toUpperCase() + ")",
@@ -664,7 +625,7 @@ function getStreamsFor(tmdbId, type, season, episode, titles, year) {
             });
         });
     }).catch(function (err) {
-        log("FAILED: " + err.message);
+        log("FAILED: " + (err && err.stack || err && err.message || err));
         return [];
     });
 }
@@ -679,13 +640,8 @@ function getStreams(tmdbId, mediaType, seasonNum, episodeNum, meta) {
 
     meta = meta || {};
     var titles = [];
-    [
-        meta.title,
-        meta.name,
-        meta.original_title,
-        meta.original_name,
-        meta.originalTitle
-    ].forEach(function (t) { if (t && titles.indexOf(t) === -1) titles.push(t); });
+    [meta.title, meta.name, meta.original_title, meta.original_name, meta.originalTitle]
+        .forEach(function (t) { if (t && titles.indexOf(t) === -1) titles.push(t); });
     (meta.aliases || meta.alternativeTitles || []).forEach(function (t) {
         if (t && titles.indexOf(t) === -1) titles.push(t);
     });
@@ -697,7 +653,7 @@ function getStreams(tmdbId, mediaType, seasonNum, episodeNum, meta) {
         " | titles=" + JSON.stringify(titles) + " | year=" + year);
 
     if (!titles.length) {
-        log("WARN: no titles supplied — search will likely fail.");
+        log("No titles — aborting. Nuvio must pass meta.title.");
         return Promise.resolve([]);
     }
 
