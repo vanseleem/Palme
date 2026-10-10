@@ -18,7 +18,7 @@ var SKIP_DUB_SUB_ARABIC = true;
 var MAX_SEARCH_PAGES = 3;
 var MAX_MOVIE_CANDIDATES = 3;
 var MAX_EPISODE_CANDIDATES = 2;
-var MAX_SERVERS = 12;
+var MAX_SERVERS = 11;
 var SITE_TIMEOUT = 15000;
 var EMBED_TIMEOUT = 12000;
 
@@ -665,7 +665,7 @@ function fetchEmbedUrls(vid) {
     collect(/<iframe\b[^>]*?\ssrc\s*=\s*["']([^"']+)["']/gi);
     collect(/data-[a-z0-9_-]+\s*=\s*["'](https?:\/\/[^"']+)["']/gi);
 
-    var reHost = /https?:\/\/[^"'\s<>]*(?:1vid|vidmoly|playmogo|uqload|dood|voe|streamtape|filemoon|upstream|mp4upload|sendvid|sibnet|mixdrop|ds2play|vidspeed|ok\.ru|vk\.com|vkvideo|hgcloud|vidhide|listeamed)[^"'\s<>]*/gi;
+    var reHost = /https?:\/\/[^"'\s<>]*(?:1vid|vidmoly|playmogo|uqload|dood|voe|streamtape|filemoon|upstream|mp4upload|sendvid|sibnet|mixdrop|ds2play|vidspeed|ok\.ru|vk\.com|vkvideo|hgcloud|vidhide|listeamed|bysesukior)[^"'\s<>]*/gi;
     collect(reHost);
 
     log('play.php extracted ' + urls.length + ' embed URL(s)');
@@ -694,6 +694,7 @@ function serverLabel(host) {
   if (/mp4upload/.test(host)) return 'MP4Upload';
   if (/sibnet/.test(host)) return 'Sibnet';
   if (/upstream/.test(host)) return 'Upstream';
+  if (/bysesukior/.test(host)) return 'Bysesukior';
   return host.split('.').slice(-2, -1)[0] || host;
 }
 
@@ -881,7 +882,7 @@ function resolveEmbed(embedUrl) {
   var job;
   if (/(^|\.)vk\.com$|(^|\.)vkvideo\.ru$/.test(host)) job = extractVk(embedUrl);
   else if (/(^|\.)ok\.ru$/.test(host)) job = extractOk(embedUrl);
-  else if (/dood|playmogo|uqload|ds2play|vidspeed/.test(host)) job = extractDood(embedUrl);
+  else if (/dood|playmogo|uqload|ds2play|vidspeed|bysesukior/.test(host)) job = extractDood(embedUrl);
   else job = extractGeneric(embedUrl);
 
   return job.then(function (items) {
@@ -909,7 +910,6 @@ function getServerStreams(vid, title) {
     var streams = [];
     var seenServers = {};
     groups.forEach(function (items) {
-      if (streams.length >= MAX_SERVERS) return;
       if (!items.length) return;
       // Keep only the best quality for this server.
       items.sort(function (a, b) { return qualityRank(b.quality) - qualityRank(a.quality); });
@@ -926,8 +926,9 @@ function getServerStreams(vid, title) {
         provider: PROVIDER_ID
       });
     });
-    log('returning ' + streams.length + ' unique server stream(s)');
-    return streams;
+    var limited = streams.slice(0, MAX_SERVERS);
+    log('returning ' + limited.length + ' unique server stream(s) (cap=' + MAX_SERVERS + ')');
+    return limited;
   });
 }
 
