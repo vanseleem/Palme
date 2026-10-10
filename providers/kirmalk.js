@@ -1,6 +1,8 @@
 var BASE_URL = 'https://kirmalk.com';
 var TMDB_API_KEY = '83d364331c40bfbe29858aeed82f45cc';
 var DEBUG = true;
+// When no stream is found, return ONE fake entry whose title is the failure trace, so it is visible inside Nuvio.
+var DEBUG_STREAM = true;
 
 var MAX_SEARCH_PAGES = 3;
 var MAX_QUERIES = 6;
@@ -12,8 +14,12 @@ var HOST_TIMEOUT = 15000;
 var UA_SITE = 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Mobile Safari/537.36';
 var UA_HOST = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
+var TRACE = [];
+
 function log(message) {
-  if (DEBUG) console.log('[Kirmalk] ' + message);
+  TRACE.push(String(message));
+  if (TRACE.length > 80) TRACE.shift();
+  if (DEBUG && typeof console !== 'undefined') console.log('[Kirmalk] ' + message);
 }
 
 // ───────────────────────────── Text helpers ─────────────────────────────
@@ -192,6 +198,7 @@ function numberTokens(str) {
 // ───────────────────────────────── HTTP ─────────────────────────────────
 
 function withTimeout(promise, ms, label) {
+  if (typeof setTimeout !== 'function') return promise;
   return new Promise(function (resolve, reject) {
     var timer = setTimeout(function () { reject(new Error('timeout: ' + label)); }, ms);
     promise.then(
@@ -201,12 +208,27 @@ function withTimeout(promise, ms, label) {
   });
 }
 
+function doFetch(url, options) {
+  if (typeof fetch === 'function') return fetch(url, options);
+  if (typeof fetchWithTimeout === 'function') return fetchWithTimeout(url, options, SITE_TIMEOUT);
+  return Promise.reject(new Error('no fetch available in this sandbox'));
+}
+
 function fetchText(url, headers, timeoutMs) {
   var short = url.split('?')[0];
-  return withTimeout(fetch(url, { method: 'GET', headers: headers, redirect: 'follow' }), timeoutMs, short)
+  var p;
+  try {
+    p = doFetch(url, { method: 'GET', headers: headers, redirect: 'follow' });
+  } catch (e) {
+    return Promise.reject(e);
+  }
+  return withTimeout(p, timeoutMs, short)
     .then(function (res) {
-      if (!res.ok) throw new Error('HTTP ' + res.status + ' ' + short);
-      return res.text();
+      var status = res ? res.status : undefined;
+      var ok = (res && res.ok !== undefined) ? res.ok : (status === undefined || (status >= 200 && status < 400));
+      log('GET ' + short.replace(/^https?:\/\//, '') + ' -> ' + (status === undefined ? '?' : status));
+      if (!ok) throw new Error('HTTP ' + status + ' ' + short);
+      return typeof res.text === 'function' ? res.text() : String(res.body || res.data || '');
     });
 }
 
@@ -462,7 +484,7 @@ function searchQueries(queries, onEntries, afterQuery) {
 
 var BAD_ASSET = /\.(?:jpe?g|png|gif|webp|svg|ico|css|js|woff2?|ttf|eot)(?:[?#]|$)/i;
 var BAD_MEDIA = /\.(?:jpe?g|png|gif|webp|svg|ico|vtt|srt|css|js|json|html?)(?:[?#]|$)/i;
-var SKIP_HOST = /(?:^|\.)(?:kirmalk\.com|facebook\.com|twitter\.com|x\.com|instagram\.com|t\.me|wa\.me|whatsapp\.com|google\.com|googleapis\.com|gstatic\.com|googletagmanager\.com|google-analytics\.com|cloudflare\.com|jquery\.com|bootstrapcdn\.com|fontawesome\.com|youtube\.com|youtu\.be)$/i;
+var SKIP_HOST = /(?:^|\.)(?:kirmalk\.com|facebook\.com|twitter\.com|x\.com|instagram\.com|t\.me|wa\.me|whatsapp\.com|google\.com|googleapis\.com|gstatic\.com|googletagmanager\.com|google-analytics\.com|cloudflare\.com|jquery\.com|bootstrapcdn\.com|fontawesome\.com|youtube\.com|youtu\.be|w3\.org|schema\.org|jsdelivr\.net|gravatar\.com|pinterest\.com|linkedin\.com|tiktok\.com|telegram\.me)$/i;
 
 var DOOD_HOST_RE = /(?:^|\.)(?:hdup\d*\.com|doodstream\.com|dood\.(?:wf|watch|sh|re|pm|to|li|so|la|ws|yt)|d000d\.com|do7go\.com|ds2video\.com|doodstream\.com\.tr)$/i;
 
@@ -631,6 +653,20 @@ function extractHostUrls(html, pageUrl, loose) {
   return urls;
 }
 
+function rankHosts(urls) {
+  function score(u) {
+    var n = 0;
+    if (isDoodHost(u)) n += 3;
+    if (/embed|\/e\/|player|iframe|stream/i.test(u)) n += 2;
+    if (/\.(?:php|aspx?)(?:[?#]|$)/i.test(u)) n -= 1;
+    return n;
+  }
+  return urls
+    .map(function (u, i) { return { u: u, i: i, s: score(u) }; })
+    .sort(function (a, b) { return (b.s - a.s) || (a.i - b.i); })
+    .map(function (x) { return x.u; });
+}
+
 function resolveHost(hostUrl, referer, depth) {
   log('host: ' + hostUrl);
   var h = hostOf(hostUrl);
@@ -644,36 +680,20 @@ function resolveHost(hostUrl, referer, depth) {
     'Accept-Language': 'ar,en;q=0.9'
   }, HOST_TIMEOUT).then(function (html) {
     if (/Embeds disabled|Embed disabled|embedding is disabled/i.test(html)) {
-      log('DoodStream embed disabled — trying /d/ page');
-      var codeMatch = /embed-([a-z0-9]+)\.html/i.exec(hostUrl) || /\/e\/([a-z0-9]+)/i.exec(hostUrl);
-      if (codeMatch) {
-        var dPage = 'https://' + h + '/d/' + codeMatch[1];
-        return fetchText(dPage, {
-          'User-Agent': UA_HOST,
-          'Referer': BASE_URL + '/'
-        }, HOST_TIMEOUT).then(function (dHtml) {
-          var direct = extractMedia(dHtml, dPage, false);
-          if (direct.length) return [{ pageUrl: dPage, media: direct }];
-          var downloadLinks = [];
-          var re = /href\s*=\s*["'](https?:\/\/[^"']*\/d\/[^"']+)["']/gi;
-          var lm;
-          while ((lm = re.exec(dHtml)) !== null) downloadLinks.push(lm[1]);
-          if (!downloadLinks.length) return [];
-          return sequentialFirst(downloadLinks.slice(0, 2), function (dl) {
-            return fetchText(dl, {
-              'User-Agent': UA_HOST,
-              'Referer': dPage
-            }, HOST_TIMEOUT).then(function (dlHtml) {
-              var m2 = extractMedia(dlHtml, dl, false);
-              if (m2.length) return [{ pageUrl: dl, media: m2 }];
-              return doodMediaFromPage(dlHtml, dl).then(function (m3) {
-                return m3.length ? [{ pageUrl: dl, media: m3 }] : [];
-              });
-            }).catch(function () { return []; });
+      log('embed disabled by host (referer sent: ' + (depth === 0 ? BASE_URL + '/' : referer) + ') — trying /e/ and /d/');
+      var codeMatch = /embed-([a-z0-9]+)\.html/i.exec(hostUrl) || /\/[ed]\/([a-z0-9]+)/i.exec(hostUrl);
+      if (!codeMatch) return [];
+      var alts = ['https://' + h + '/e/' + codeMatch[1], 'https://' + h + '/d/' + codeMatch[1]];
+      return sequentialFirst(alts, function (alt) {
+        return fetchText(alt, { 'User-Agent': UA_HOST, 'Referer': BASE_URL + '/' }, HOST_TIMEOUT).then(function (aHtml) {
+          if (/Embeds disabled|Embed disabled|embedding is disabled/i.test(aHtml)) return [];
+          var direct = extractMedia(aHtml, alt, false);
+          if (direct.length) return [{ pageUrl: alt, media: direct }];
+          return doodMediaFromPage(aHtml, alt).then(function (m3) {
+            return m3.length ? [{ pageUrl: alt, media: m3 }] : [];
           });
         }).catch(function () { return []; });
-      }
-      return [];
+      });
     }
 
     if (dood) {
@@ -738,14 +758,14 @@ function resolveVid(vid, label) {
   var watchUrl = BASE_URL + '/watch.php?vid=' + vid;
   var pages = [
     { url: BASE_URL + '/embed.php?vid=' + vid, referer: watchUrl, strict: false },
-    { url: BASE_URL + '/view.php?vid=' + vid, referer: watchUrl, strict: false },
+    { url: BASE_URL + '/view.php?vid=' + vid, referer: watchUrl, strict: false, loose: true },
     { url: watchUrl, referer: BASE_URL + '/', strict: true }
   ];
   return sequentialFirst(pages, function (p) {
     return siteGet(p.url, p.referer).then(function (html) {
       var direct = extractMedia(html, p.url, p.strict);
       if (direct.length) return [{ pageUrl: p.url, media: direct }];
-      var hosts = extractHostUrls(html, p.url, !p.strict && html.length < 4000).slice(0, 3);
+      var hosts = rankHosts(extractHostUrls(html, p.url, p.loose || (!p.strict && html.length < 4000))).slice(0, 5);
       log(p.url.split('?')[0].replace(BASE_URL, '') + ' -> ' + hosts.length + ' host url(s)');
       return sequentialFirst(hosts, function (h) { return resolveHost(h, p.url, 0); });
     }).catch(function (err) {
@@ -956,7 +976,20 @@ function tvStreams(meta, S, E) {
 
 // ──────────────────────────────── Entry point ───────────────────────────
 
+function debugStreams(reason) {
+  if (!DEBUG_STREAM) return [];
+  var lines = TRACE.slice(-9).map(function (l) { return l.length > 110 ? l.slice(0, 110) + '…' : l; });
+  return [{
+    name: 'Kirmalk DEBUG',
+    title: ('NO STREAMS (' + reason + ')\n' + lines.join('\n')).slice(0, 900),
+    url: BASE_URL + '/',
+    quality: 'Auto',
+    headers: {}
+  }];
+}
+
 function getStreams(tmdbId, mediaType, season, episode) {
+  TRACE = [];
   log('request: ' + tmdbId + ' ' + mediaType + ' S' + season + 'E' + episode);
   if (!tmdbId) return Promise.resolve([]);
   var type = mediaType === 'movie' ? 'movie' : mediaType === 'tv' ? 'tv' : null;
@@ -973,11 +1006,15 @@ function getStreams(tmdbId, mediaType, season, episode) {
     return type === 'movie' ? movieStreams(meta) : tvStreams(meta, S, E);
   }).then(function (streams) {
     log('final streams: ' + streams.length);
-    return streams;
+    return streams.length ? streams : debugStreams('none found');
   }).catch(function (err) {
     log('getStreams error: ' + (err && err.message));
-    return [];
+    return debugStreams('error');
   });
 }
 
-module.exports = { getStreams: getStreams };
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = { getStreams: getStreams };
+} else if (typeof global !== 'undefined') {
+  global.getStreams = getStreams;
+}
