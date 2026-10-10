@@ -9,8 +9,8 @@ var SITE_TIMEOUT = 15000;
 var HOST_TIMEOUT = 15000;
 
 // NEW: these were used but never declared. Set both to false once everything works again.
-var DEBUG = true;
-var DEBUG_STREAM = true;
+var DEBUG = false;
+var DEBUG_STREAM = false;
 
 var UA_SITE = 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Mobile Safari/537.36';
 var UA_HOST = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
