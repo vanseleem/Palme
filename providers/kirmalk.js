@@ -8,6 +8,8 @@ var MAX_SEARCH_PAGES = 3;
 var MAX_QUERIES = 6;
 var MAX_GROUPS = 4;
 var MAX_MOVIE_CANDIDATES = 4;
+// Max servers resolved per episode/movie (the site lists 4; the extra slots are for stray player URLs).
+var MAX_SERVERS = 6;
 var SITE_TIMEOUT = 15000;
 var HOST_TIMEOUT = 15000;
 
@@ -667,6 +669,72 @@ function rankHosts(urls) {
     .map(function (x) { return x.u; });
 }
 
+function isSiteUrl(url) {
+  return hostOf(url) === hostOf(BASE_URL);
+}
+
+// Loose URL scans pick up everything; keep only what looks like a player / embed page.
+function looksLikePlayerUrl(url) {
+  return isDoodHost(url) || /embed|\/[evd]\/|player|iframe|stream|\.html?(?:[?#]|$)/i.test(url);
+}
+
+// One attribute value / onclick string of a server button -> absolute URL ('' when it is not a URL).
+function serverUrlFromValue(val, pageUrl) {
+  var v = decodeEntities(val).replace(/\\\//g, '/').trim();
+  if (!v || v.charAt(0) === '#') return '';
+  if (/^(?:https?:)?\/\//i.test(v) || /^\/[^\s]/.test(v) || /\.php(?:[?#]|$)/i.test(v)) return absoluteUrl(v, pageUrl);
+  if (v.charAt(0) === '?') return pageUrl.split('#')[0].split('?')[0] + v;
+  if (/^[A-Za-z0-9+\/]{24,}={0,2}$/.test(v) && typeof atob === 'function') {
+    try {
+      var bm = /https?:\/\/[^"'\s<>]+/i.exec(atob(v));
+      if (bm) return bm[0];
+    } catch (e) { /* not base64 */ }
+  }
+  return '';
+}
+
+// view.php shows the servers as buttons ("سيرفر 1" ... "سيرفر 4"); read the URL each button carries
+// in its own attributes / onclick (absolute, relative to the site, or base64).
+function extractServerButtons(html, pageUrl) {
+  var out = [];
+  if (!/(?:سيرفر|server)\s*[\d\u0660-\u0669]/i.test(html)) return out;
+  var seen = {};
+  var re = /<(?:a|button|li|div|span|option|p)\b([^>]*)>/gi;
+  var m;
+  while ((m = re.exec(html)) !== null) {
+    var lead = toWesternDigits(stripTags(html.slice(re.lastIndex, re.lastIndex + 160)));
+    var lm = /^(?:سيرفر|server)\s*(\d{1,2})(?!\d)/i.exec(lead);
+    if (!lm) continue;
+    var n = parseInt(lm[1], 10);
+    log('server tag ' + n + ': ' + m[0].replace(/\s+/g, ' ').slice(0, 140));
+    var attrRe = /([\w:-]+)\s*=\s*(?:"([^"]*)"|'([^']*)')/g;
+    var am;
+    while ((am = attrRe.exec(m[1])) !== null) {
+      var name = am[1].toLowerCase();
+      if (name === 'class' || name === 'id' || name === 'style' || name === 'title') continue;
+      var val = decodeEntities(am[2] !== undefined ? am[2] : am[3]);
+      var values = [val];
+      if (name.indexOf('on') === 0 || /^\s*javascript:/i.test(val)) {
+        values = [];
+        val.replace(/["']([^"']{6,})["']/g, function (whole, s) { values.push(s); return whole; });
+      }
+      values.forEach(function (v) {
+        var url = serverUrlFromValue(v, pageUrl);
+        if (!/^https?:\/\//i.test(url) || BAD_ASSET.test(url)) return;
+        if (SKIP_HOST.test(hostOf(url)) && !isSiteUrl(url)) return;
+        var key = n + '|' + url;
+        if (seen[key]) return;
+        seen[key] = true;
+        out.push({ n: n, url: url });
+      });
+    }
+  }
+  return out
+    .map(function (x, i) { return { x: x, i: i }; })
+    .sort(function (a, b) { return (a.x.n - b.x.n) || (a.i - b.i); })
+    .map(function (e) { return e.x; });
+}
+
 function resolveHost(hostUrl, referer, depth) {
   log('host: ' + hostUrl);
   var h = hostOf(hostUrl);
@@ -733,7 +801,7 @@ function qualityFromUrl(url) {
   return 'Auto';
 }
 
-function buildStreams(resolved, label) {
+function buildStreams(resolved, label, tag) {
   var streams = [];
   var seen = {};
   resolved.forEach(function (r) {
@@ -743,7 +811,7 @@ function buildStreams(resolved, label) {
       seen[url] = true;
       streams.push({
         name: 'Kirmalk',
-        title: 'Kirmalk \u2022 ' + label,
+        title: 'Kirmalk \u2022 ' + label + (tag ? ' \u2022 ' + tag : ''),
         url: url,
         quality: qualityFromUrl(url),
         headers: { 'User-Agent': UA_HOST, 'Referer': origin + '/', 'Origin': origin }
@@ -753,27 +821,104 @@ function buildStreams(resolved, label) {
   return streams;
 }
 
-// vid -> embed.php (external host URL) -> host player -> direct stream(s)
-function resolveVid(vid, label) {
+// One server entry -> [{ pageUrl, media: [direct urls] }] (empty when it cannot be resolved).
+function resolveServer(srv) {
+  if (srv.media) return Promise.resolve([{ pageUrl: srv.url, media: srv.media }]);
+  if (!isSiteUrl(srv.url)) return resolveHost(srv.url, BASE_URL + '/', 0);
+
+  // The button points back at a kirmalk page that holds the player.
+  return siteGet(srv.url, BASE_URL + '/').then(function (html) {
+    var direct = extractMedia(html, srv.url, false);
+    if (direct.length) return [{ pageUrl: srv.url, media: direct }];
+    var hosts = extractHostUrls(html, srv.url, false);
+    if (!hosts.length) hosts = extractHostUrls(html, srv.url, true).filter(looksLikePlayerUrl);
+    return sequentialFirst(rankHosts(hosts).slice(0, 3), function (h) { return resolveHost(h, srv.url, 0); });
+  }).catch(function (err) {
+    log('server page failed: ' + (err && err.message));
+    return [];
+  });
+}
+
+// Every server the site offers for one vid: view.php lists them as "سيرفر 1..4", embed.php exposes one URL.
+function collectServers(vid) {
   var watchUrl = BASE_URL + '/watch.php?vid=' + vid;
-  var pages = [
-    { url: BASE_URL + '/embed.php?vid=' + vid, referer: watchUrl, strict: false },
-    { url: BASE_URL + '/view.php?vid=' + vid, referer: watchUrl, strict: false, loose: true },
-    { url: watchUrl, referer: BASE_URL + '/', strict: true }
-  ];
-  return sequentialFirst(pages, function (p) {
-    return siteGet(p.url, p.referer).then(function (html) {
-      var direct = extractMedia(html, p.url, p.strict);
-      if (direct.length) return [{ pageUrl: p.url, media: direct }];
-      var hosts = rankHosts(extractHostUrls(html, p.url, p.loose || (!p.strict && html.length < 4000))).slice(0, 5);
-      log(p.url.split('?')[0].replace(BASE_URL, '') + ' -> ' + hosts.length + ' host url(s)');
-      return sequentialFirst(hosts, function (h) { return resolveHost(h, p.url, 0); });
+  var viewUrl = BASE_URL + '/view.php?vid=' + vid;
+  var embedUrl = BASE_URL + '/embed.php?vid=' + vid;
+  var servers = [];
+  var seen = {};
+
+  function add(url, n, media) {
+    var key = url + (media ? '|direct' : '');
+    if (!url || seen[key]) return;
+    seen[key] = true;
+    servers.push({ url: url, n: n || null, media: media || null });
+  }
+
+  var viewP = siteGet(viewUrl, watchUrl).then(function (html) {
+    var buttons = extractServerButtons(html, viewUrl);
+    var frames = extractHostUrls(html, viewUrl, false);
+    var extra = extractHostUrls(html, viewUrl, true).filter(looksLikePlayerUrl);
+    log('view.php: ' + buttons.length + ' button url(s), ' + frames.length + ' frame(s), ' + extra.length + ' player-like url(s)');
+    return { buttons: buttons, urls: frames.concat(extra) };
+  }).catch(function (err) {
+    log('view.php failed: ' + (err && err.message));
+    return { buttons: [], urls: [] };
+  });
+
+  var embedP = siteGet(embedUrl, watchUrl).then(function (html) {
+    return { media: extractMedia(html, embedUrl, false), urls: extractHostUrls(html, embedUrl, true) };
+  }).catch(function (err) {
+    log('embed.php failed: ' + (err && err.message));
+    return { media: [], urls: [] };
+  });
+
+  return Promise.all([viewP, embedP]).then(function (r) {
+    r[0].buttons.forEach(function (b) { add(b.url, b.n, null); });
+    r[0].urls.forEach(function (u) { add(u, null, null); });
+    if (r[1].media.length) add(embedUrl, null, r[1].media);
+    r[1].urls.forEach(function (u) { add(u, null, null); });
+    if (servers.length) return servers;
+
+    // Nothing on view.php / embed.php: last resort is the watch page itself.
+    return siteGet(watchUrl, BASE_URL + '/').then(function (html) {
+      var direct = extractMedia(html, watchUrl, true);
+      if (direct.length) add(watchUrl, null, direct);
+      extractHostUrls(html, watchUrl, false).forEach(function (u) { add(u, null, null); });
+      return servers;
     }).catch(function (err) {
-      log('page failed (' + p.url.replace(BASE_URL, '') + '): ' + (err && err.message));
-      return [];
+      log('watch.php failed: ' + (err && err.message));
+      return servers;
     });
-  }).then(function (resolved) {
-    var streams = buildStreams(resolved, label);
+  });
+}
+
+function serverTag(srv, resolved) {
+  var host = hostOf((resolved && resolved[0] && resolved[0].pageUrl) || srv.url);
+  return (srv.n ? 'Server ' + srv.n + ' \u2022 ' : '') + (host || 'direct');
+}
+
+// vid -> every server (view.php buttons / iframe, embed.php) -> host player -> direct stream(s), one entry per server
+function resolveVid(vid, label) {
+  return collectServers(vid).then(function (servers) {
+    var targets = servers.slice(0, MAX_SERVERS);
+    log('vid ' + vid + ' -> ' + servers.length + ' server(s), resolving ' + targets.length);
+    return Promise.all(targets.map(function (srv, i) {
+      return resolveServer(srv).then(function (resolved) {
+        var links = resolved.reduce(function (sum, r) { return sum + r.media.length; }, 0);
+        log('server ' + (srv.n || ('#' + (i + 1))) + ' (' + (hostOf(srv.url) || 'direct') + ') -> ' + links + ' link(s)');
+        return buildStreams(resolved, label, serverTag(srv, resolved));
+      });
+    }));
+  }).then(function (groups) {
+    var streams = [];
+    var seen = {};
+    groups.forEach(function (group) {
+      group.forEach(function (s) {
+        if (seen[s.url]) return;
+        seen[s.url] = true;
+        streams.push(s);
+      });
+    });
     log('vid ' + vid + ' -> ' + streams.length + ' stream(s)');
     return streams;
   });
