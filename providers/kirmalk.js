@@ -1,22 +1,3 @@
-'use strict';
-
-/**
- * Kirmalk (kirmalk.com) - Nuvio provider
- *
- * Flow
- *   TMDB id -> Arabic/English titles -> site search (search.php?keywords=)
- *   movies : title + year match -> watch.php?vid -> embed.php?vid -> host player -> m3u8/mp4
- *   series : title/season match -> episode list on the watch page -> embed.php -> host player
- *
- * Site facts (verified on live pages)
- *   - Episode titles : "مسلسل NAME [N] الحلقة 26 ... مدبلجة|مترجمة HD"
- *   - Season N       : trailing digit in the name ("الاعراف 2") or "الموسم N"; season 1 has no digit
- *   - Movie titles   : "مشاهدة فيلم NAME 2025 HD"
- *   - Episode list   : "المواسم والحلقات" block, anchors "N حلقة" -> watch.php?vid=ID (per season/variant)
- *   - Player         : embed.php?vid=ID returns the external host URL (embed-XXXX.html)
- *
- * Nuvio sandbox rules: Promise chains only, fetch() only, regex parsing, no Node modules.
- */
 
 var BASE_URL = 'https://kirmalk.com';
 var TMDB_API_KEY = '83d364331c40bfbe29858aeed82f45cc';
@@ -484,6 +465,35 @@ var BAD_ASSET = /\.(?:jpe?g|png|gif|webp|svg|ico|css|js|woff2?|ttf|eot)(?:[?#]|$
 var BAD_MEDIA = /\.(?:jpe?g|png|gif|webp|svg|ico|vtt|srt|css|js|json|html?)(?:[?#]|$)/i;
 var SKIP_HOST = /(?:^|\.)(?:kirmalk\.com|facebook\.com|twitter\.com|x\.com|instagram\.com|t\.me|wa\.me|whatsapp\.com|google\.com|googleapis\.com|gstatic\.com|googletagmanager\.com|google-analytics\.com|cloudflare\.com|jquery\.com|bootstrapcdn\.com|fontawesome\.com|youtube\.com|youtu\.be)$/i;
 
+var DOOD_HOST_RE = /(?:^|\.)(?:hdup\d*\.com|doodstream\.com|dood\.(?:wf|watch|sh|re|pm|to|li|so|la|ws|yt)|d000d\.com|do7go\.com|ds2video\.com|doodstream\.com\.tr)$/i;
+
+function isDoodHost(url) {
+  var h = hostOf(url);
+  return DOOD_HOST_RE.test(h);
+}
+
+function doodMediaFromPage(html, pageUrl) {
+  var media = extractMedia(html, pageUrl, false);
+  if (media.length) return Promise.resolve(media);
+
+  var m = /\/pass_md5\/[^"']+/i.exec(html);
+  if (!m) return Promise.resolve([]);
+  var passPath = m[0];
+  var h = hostOf(pageUrl);
+  var passUrl = 'https://' + h + passPath;
+
+  return fetchText(passUrl, {
+    'User-Agent': UA_HOST,
+    'Referer': 'https://' + h + '/'
+  }, HOST_TIMEOUT).then(function (token) {
+    token = String(token).trim();
+    if (!token || token.length < 10) return [];
+    var ts = Date.now();
+    var finalUrl = token + (token.indexOf('?') === -1 ? '?' : '') + 'token=' + token + '&expiry=' + ts;
+    return [finalUrl];
+  }).catch(function () { return []; });
+}
+
 function decodeBase(token, radix) {
   var alphabet = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
   var n = 0;
@@ -607,18 +617,65 @@ function extractHostUrls(html, pageUrl, loose) {
 
 function resolveHost(hostUrl, referer, depth) {
   log('host: ' + hostUrl);
+  var h = hostOf(hostUrl);
+  var dood = isDoodHost(hostUrl);
+
   return fetchText(hostUrl, {
     'User-Agent': UA_HOST,
-    'Referer': referer,
+    'Referer': dood ? 'https://' + h + '/' : referer,
     'Accept': 'text/html,application/xhtml+xml,*/*',
     'Accept-Language': 'ar,en;q=0.9'
   }, HOST_TIMEOUT).then(function (html) {
+    if (/Embeds disabled|Embed disabled|embedding is disabled/i.test(html)) {
+      log('DoodStream embed disabled — trying /d/ page');
+      var codeMatch = /embed-([a-z0-9]+)\.html/i.exec(hostUrl) || /\/e\/([a-z0-9]+)/i.exec(hostUrl);
+      if (codeMatch) {
+        var dPage = 'https://' + h + '/d/' + codeMatch[1];
+        return fetchText(dPage, {
+          'User-Agent': UA_HOST,
+          'Referer': 'https://' + h + '/'
+        }, HOST_TIMEOUT).then(function (dHtml) {
+          var direct = extractMedia(dHtml, dPage, false);
+          if (direct.length) return [{ pageUrl: dPage, media: direct }];
+          var downloadLinks = [];
+          var re = /href\s*=\s*["'](https?:\/\/[^"']*\/d\/[^"']+)["']/gi;
+          var lm;
+          while ((lm = re.exec(dHtml)) !== null) downloadLinks.push(lm[1]);
+          if (!downloadLinks.length) return [];
+          return sequentialFirst(downloadLinks.slice(0, 2), function (dl) {
+            return fetchText(dl, {
+              'User-Agent': UA_HOST,
+              'Referer': dPage
+            }, HOST_TIMEOUT).then(function (dlHtml) {
+              var m2 = extractMedia(dlHtml, dl, false);
+              if (m2.length) return [{ pageUrl: dl, media: m2 }];
+              return doodMediaFromPage(dlHtml, dl).then(function (m3) {
+                return m3.length ? [{ pageUrl: dl, media: m3 }] : [];
+              });
+            }).catch(function () { return []; });
+          });
+        }).catch(function () { return []; });
+      }
+      return [];
+    }
+
+    if (dood) {
+      return doodMediaFromPage(html, hostUrl).then(function (m) {
+        if (m.length) return [{ pageUrl: hostUrl, media: m }];
+        if (depth >= 2) return [];
+        var nested = extractHostUrls(html, hostUrl, false)
+          .filter(function (u) { return hostOf(u) !== h; })
+          .slice(0, 2);
+        return sequentialFirst(nested, function (u) { return resolveHost(u, hostUrl, depth + 1); });
+      });
+    }
+
     var media = extractMedia(html, hostUrl, false);
     log('host media found: ' + media.length);
     if (media.length) return [{ pageUrl: hostUrl, media: media }];
     if (depth >= 2) return [];
     var nested = extractHostUrls(html, hostUrl, false)
-      .filter(function (u) { return hostOf(u) !== hostOf(hostUrl); })
+      .filter(function (u) { return hostOf(u) !== h; })
       .slice(0, 2);
     return sequentialFirst(nested, function (u) { return resolveHost(u, hostUrl, depth + 1); });
   }).catch(function (err) {
@@ -672,7 +729,7 @@ function resolveVid(vid, label) {
       if (direct.length) return [{ pageUrl: p.url, media: direct }];
       var hosts = extractHostUrls(html, p.url, !p.strict && html.length < 4000).slice(0, 3);
       log(p.url.split('?')[0].replace(BASE_URL, '') + ' -> ' + hosts.length + ' host url(s)');
-      return sequentialFirst(hosts, function (h) { return resolveHost(h, BASE_URL + '/', 0); });
+      return sequentialFirst(hosts, function (h) { return resolveHost(h, p.url, 0); });
     }).catch(function (err) {
       log('page failed (' + p.url.replace(BASE_URL, '') + '): ' + (err && err.message));
       return [];
