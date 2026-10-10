@@ -1,4 +1,5 @@
 
+
 var BASE = "https://ddramacafe-tv.casa";
 var PROVIDER_ID = "dramacafe";
 var PROVIDER_NAME = "DramaCafe";
@@ -604,7 +605,6 @@ function serverLabelFromUrl(url, fallback) {
   return fallback || (h.split(".").slice(-2, -1)[0] || h);
 }
 
-// ─── FIXED cleanMediaUrl (decodes \u002F and \u0026) ───
 function cleanMediaUrl(url) {
   return String(url)
     .replace(/\\u0026/gi, "&")
@@ -671,7 +671,6 @@ function scanMediaUrls(text, baseUrl) {
 
 // ═══════════════════════ Extractors ═══════════════════════
 
-// ─── VK: HLS master + individual qualities, sorted ───
 function extractVk(embedUrl) {
   return fetchText(embedUrl, "https://vk.com/", EMBED_TIMEOUT).then(function (html) {
     var headers = {
@@ -690,16 +689,13 @@ function extractVk(embedUrl) {
       out.push({ url: url, quality: quality, headers: headers });
     }
 
-    // HLS master (single URL that covers all qualities)
     var hls = /"hls"\s*:\s*"(https?:[^"]+)"/.exec(html);
     if (hls) add(hls[1], "Auto");
 
-    // Individual MP4 qualities
     var re = /"url(\d{3,4})"\s*:\s*"(https?:[^"]+)"/g;
     var m;
     while ((m = re.exec(html)) !== null) add(m[2], m[1] + "p");
 
-    // <source src="...">
     var srcRe = /<source\s+src=["']([^"']+\.(?:mp4|m3u8)[^"']*)["']/gi;
     while ((m = srcRe.exec(html)) !== null) add(m[1], qualityFromUrl(m[1]));
 
@@ -708,7 +704,6 @@ function extractVk(embedUrl) {
   });
 }
 
-// ─── OK.ru ───
 var OK_QUALITY = { mobile: "144p", lowest: "240p", low: "360p", sd: "480p", hd: "720p", full: "1080p", quad: "1440p", ultra: "2160p" };
 function extractOk(embedUrl) {
   return fetchText(embedUrl, BASE + "/", EMBED_TIMEOUT).then(function (html) {
@@ -731,7 +726,6 @@ function extractOk(embedUrl) {
   });
 }
 
-// ─── NEW: Uqload direct MP4 ───
 function extractUqload(embedUrl) {
   return fetchText(embedUrl, BASE + "/", EMBED_TIMEOUT).then(function (html) {
     var origin = originOf(embedUrl);
@@ -743,21 +737,18 @@ function extractUqload(embedUrl) {
     };
     var out = [];
 
-    // Pattern 1: sources: [{file: "https://...mp4"}]
     var m = /sources\s*:\s*\[\s*\{\s*["']?file["']?\s*:\s*["']([^"']+)["']/i.exec(html);
     if (m) {
       out.push({ url: cleanMediaUrl(m[1]), quality: "Auto", headers: headers });
       return out;
     }
 
-    // Pattern 2: <source src="....mp4">
     var srcM = /<source\s+src=["']([^"']+\.(?:mp4|m3u8)[^"']*)["']/i.exec(html);
     if (srcM) {
       out.push({ url: cleanMediaUrl(srcM[1]), quality: qualityFromUrl(srcM[1]), headers: headers });
       return out;
     }
 
-    // Pattern 3: packer + scan
     var texts = [html].concat(unpackPacker(html));
     var seen = {};
     texts.forEach(function (t) {
@@ -771,7 +762,6 @@ function extractUqload(embedUrl) {
   });
 }
 
-// ─── Generic (packer + media scan) ───
 function extractGeneric(embedUrl) {
   return fetchText(embedUrl, BASE + "/", EMBED_TIMEOUT).then(function (html) {
     var texts = [html].concat(unpackPacker(html));
@@ -790,7 +780,6 @@ function extractGeneric(embedUrl) {
   });
 }
 
-// ─── Dispatcher: returns ONLY the best quality from this server ───
 function resolveEmbed(embedUrl, label) {
   var host = hostOf(embedUrl);
   var job;
@@ -814,7 +803,6 @@ function resolveEmbed(embedUrl, label) {
 
 // ═══════════════════════ Resolve ═══════════════════════
 
-// Reliability priority — most likely to yield a direct stream first
 var SERVER_PRIORITY = ["vk", "vidspeed", "1vid", "uqload", "hgcloud", "listeamed"];
 
 function serverPriority(label) {
@@ -840,21 +828,32 @@ function resolveVid(vid, displayTitle) {
   }).then(function (servers) {
     if (!servers.length) { log("no servers available"); return []; }
 
-    // Sort by reliability priority
+    // Sort by reliability priority — VK first, then Vidspeed, 1vid, Uqload, etc.
     servers.sort(function (a, b) {
       return serverPriority(a.label) - serverPriority(b.label);
     });
 
-    // Resolve each server. Each contributes ONE best-quality link (or nothing).
+    log("resolving ALL " + servers.length + " server(s) in parallel (MAX_SERVERS=" + MAX_SERVERS + " caps the visible list)");
+
+    // Resolve EVERY server — nothing is skipped, so no source is ever missed.
     return Promise.all(servers.map(function (srv) {
       var label = srv.label || serverLabelFromUrl(srv.url, "Server " + srv.number);
-      return resolveEmbed(srv.url, label);
-    })).then(function (groups) {
+      return resolveEmbed(srv.url, label).then(function (streams) {
+        return { priority: serverPriority(label), label: label, streams: streams };
+      });
+    })).then(function (results) {
+      // Drop servers that returned nothing
+      var working = results.filter(function (r) { return r.streams.length > 0; });
+      log("working servers: " + working.length + " (from " + results.length + " total)");
+
+      // Apply MAX_SERVERS cap AFTER priority sort and AFTER filtering
+      var capped = working.slice(0, MAX_SERVERS);
+
+      // Flatten — 1 stream per server (best quality only)
       var out = [];
       var seen = {};
-
-      groups.forEach(function (g) {
-        g.forEach(function (it) {
+      capped.forEach(function (r) {
+        r.streams.slice(0, 1).forEach(function (it) {
           if (seen[it.url]) return;
           seen[it.url] = 1;
           var q = it.quality || "Auto";
@@ -871,8 +870,7 @@ function resolveVid(vid, displayTitle) {
         });
       });
 
-      out.sort(function (a, b) { return qualityRank(b.quality) - qualityRank(a.quality); });
-      log("total streams (direct only, one per server): " + out.length);
+      log("returning " + out.length + " stream(s) from top " + capped.length + " server(s)");
       return out;
     });
   });
