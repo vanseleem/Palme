@@ -1,14 +1,9 @@
 var BASE_URL = 'https://kirmalk.com';
 var TMDB_API_KEY = '83d364331c40bfbe29858aeed82f45cc';
-var DEBUG = false;
-// When no stream is found, return ONE fake entry whose title is the failure trace, so it is visible inside Nuvio.
-var DEBUG_STREAM = false;
-
 var MAX_SEARCH_PAGES = 3;
 var MAX_QUERIES = 6;
 var MAX_GROUPS = 4;
 var MAX_MOVIE_CANDIDATES = 4;
-// Max servers resolved per episode/movie (the site lists 4).
 var MAX_SERVERS = 4;
 var SITE_TIMEOUT = 15000;
 var HOST_TIMEOUT = 15000;
@@ -1121,6 +1116,18 @@ function tvStreams(meta, S, E) {
 
 // ──────────────────────────────── Entry point ───────────────────────────
 
+function debugStreams(reason) {
+  if (!DEBUG_STREAM) return [];
+  var lines = TRACE.slice(-9).map(function (l) { return l.length > 110 ? l.slice(0, 110) + '…' : l; });
+  return [{
+    name: 'Kirmalk DEBUG',
+    title: ('NO STREAMS (' + reason + ')\n' + lines.join('\n')).slice(0, 900),
+    url: BASE_URL + '/',
+    quality: 'Auto',
+    headers: {}
+  }];
+}
+
 function getStreams(tmdbId, mediaType, season, episode) {
   TRACE = [];
   log('request: ' + tmdbId + ' ' + mediaType + ' S' + season + 'E' + episode);
@@ -1139,10 +1146,10 @@ function getStreams(tmdbId, mediaType, season, episode) {
     return type === 'movie' ? movieStreams(meta) : tvStreams(meta, S, E);
   }).then(function (streams) {
     log('final streams: ' + streams.length);
-    return streams;
+    return streams.length ? streams : debugStreams('none found');
   }).catch(function (err) {
     log('getStreams error: ' + (err && err.message));
-    return [];
+    return debugStreams('error');
   });
 }
 
