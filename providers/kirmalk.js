@@ -1,4 +1,3 @@
-
 var BASE_URL = 'https://kirmalk.com';
 var TMDB_API_KEY = '83d364331c40bfbe29858aeed82f45cc';
 var DEBUG = true;
@@ -472,26 +471,43 @@ function isDoodHost(url) {
   return DOOD_HOST_RE.test(h);
 }
 
+function randomString(len) {
+  var chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  var out = '';
+  for (var i = 0; i < len; i++) out += chars.charAt(Math.floor(Math.random() * chars.length));
+  return out;
+}
+
+// DoodStream-style player page:
+//   $.get('/pass_md5/<id>/<token>', d => src = d + makePlay())
+//   makePlay() = <10 random chars> + "?token=<token>&expiry=" + Date.now()
 function doodMediaFromPage(html, pageUrl) {
-  var media = extractMedia(html, pageUrl, false);
+  var media = extractMedia(html, pageUrl, true);
   if (media.length) return Promise.resolve(media);
 
-  var m = /\/pass_md5\/[^"']+/i.exec(html);
+  var m = /\/pass_md5\/[^"'\s<>]+/i.exec(html);
   if (!m) return Promise.resolve([]);
   var passPath = m[0];
   var h = hostOf(pageUrl);
-  var passUrl = 'https://' + h + passPath;
 
-  return fetchText(passUrl, {
+  var tm = /token=([A-Za-z0-9]+)&expiry/.exec(html);
+  var token = tm ? tm[1] : passPath.split('/').pop();
+
+  return fetchText('https://' + h + passPath, {
     'User-Agent': UA_HOST,
-    'Referer': 'https://' + h + '/'
-  }, HOST_TIMEOUT).then(function (token) {
-    token = String(token).trim();
-    if (!token || token.length < 10) return [];
-    var ts = Date.now();
-    var finalUrl = token + (token.indexOf('?') === -1 ? '?' : '') + 'token=' + token + '&expiry=' + ts;
-    return [finalUrl];
-  }).catch(function () { return []; });
+    'Referer': pageUrl,
+    'X-Requested-With': 'XMLHttpRequest'
+  }, HOST_TIMEOUT).then(function (base) {
+    base = String(base).trim();
+    if (!/^https?:\/\//i.test(base)) {
+      log('pass_md5 unexpected body: ' + base.slice(0, 60));
+      return [];
+    }
+    return [base + randomString(10) + '?token=' + token + '&expiry=' + Date.now()];
+  }).catch(function (err) {
+    log('pass_md5 failed: ' + (err && err.message));
+    return [];
+  });
 }
 
 function decodeBase(token, radix) {
@@ -620,9 +636,10 @@ function resolveHost(hostUrl, referer, depth) {
   var h = hostOf(hostUrl);
   var dood = isDoodHost(hostUrl);
 
+  // First hop must look like the iframe on kirmalk.com (embeds are whitelisted per referring site).
   return fetchText(hostUrl, {
     'User-Agent': UA_HOST,
-    'Referer': dood ? 'https://' + h + '/' : referer,
+    'Referer': depth === 0 ? BASE_URL + '/' : referer,
     'Accept': 'text/html,application/xhtml+xml,*/*',
     'Accept-Language': 'ar,en;q=0.9'
   }, HOST_TIMEOUT).then(function (html) {
@@ -633,7 +650,7 @@ function resolveHost(hostUrl, referer, depth) {
         var dPage = 'https://' + h + '/d/' + codeMatch[1];
         return fetchText(dPage, {
           'User-Agent': UA_HOST,
-          'Referer': 'https://' + h + '/'
+          'Referer': BASE_URL + '/'
         }, HOST_TIMEOUT).then(function (dHtml) {
           var direct = extractMedia(dHtml, dPage, false);
           if (direct.length) return [{ pageUrl: dPage, media: direct }];
@@ -661,6 +678,7 @@ function resolveHost(hostUrl, referer, depth) {
 
     if (dood) {
       return doodMediaFromPage(html, hostUrl).then(function (m) {
+        log('dood media found: ' + m.length);
         if (m.length) return [{ pageUrl: hostUrl, media: m }];
         if (depth >= 2) return [];
         var nested = extractHostUrls(html, hostUrl, false)
