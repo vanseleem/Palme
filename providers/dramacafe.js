@@ -343,7 +343,7 @@ function resolveServer(server) {
     urlPromise = extractVk(embedUrl);
   } else if (/ok\.ru/.test(host)) {
     urlPromise = extractOk(embedUrl);
-  } else if (/dood|playmogo|uqload|ds2play|vidspeed|bysesukior/.test(host)) {
+  } else if (/dood|playmogo|uqload|ds2play|vidspeed|bysesukior|mixdrop|hgcloud|voe/.test(host)) {
     urlPromise = extractDood(embedUrl);
   } else {
     urlPromise = fetchText(embedUrl, BASE + "/").then(function(html) {
@@ -354,16 +354,16 @@ function resolveServer(server) {
   }
 
   return urlPromise.then(function(items) {
-    if (!items.length) {
-      console.log("[DramaCafe] no direct URL for", server.name, "- skipping");
-      return [];
+    if (items.length) {
+      items.sort(function(a, b) { return qualityRankValue(b.quality) - qualityRankValue(a.quality); });
+      var best = items[0];
+      return [makeStream(best.url, server.name, embedUrl, best.quality)];
     }
-    items.sort(function(a, b) { return qualityRankValue(b.quality) - qualityRankValue(a.quality); });
-    var best = items[0];
-    return [makeStream(best.url, server.name, embedUrl, best.quality)];
+    console.log("[DramaCafe] no direct URL for", server.name, "- using embed fallback");
+    return [makeStream(embedUrl, server.name + " (embed)", embedUrl, "Auto")];
   }).catch(function(err) {
-    console.log("[DramaCafe] server error:", server.name, err.message);
-    return [];
+    console.log("[DramaCafe] server error:", server.name, err.message, "- using embed fallback");
+    return [makeStream(embedUrl, server.name + " (embed)", embedUrl, "Auto")];
   });
 }
 
@@ -374,7 +374,9 @@ function resolveSingleServer(vid) {
     if (!playerUrl) return [];
     return fetchText(playerUrl, embedUrl).then(function(playerHtml) {
       var directUrls = extractStreamsFromPlayer(playerHtml);
-      if (!directUrls.length) return [];
+      if (!directUrls.length) {
+        return [makeStream(playerUrl, "Server (embed)", playerUrl, "Auto")];
+      }
       directUrls.sort(function(a, b) { return qualityRankValue(qualityFromUrl(b)) - qualityRankValue(qualityFromUrl(a)); });
       return [makeStream(directUrls[0], "Server", playerUrl)];
     }).catch(function(err) {
