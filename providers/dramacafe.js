@@ -1,7 +1,7 @@
 var BASE = "https://ddramacafe-tv.casa";
 var UA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Mobile Safari/537.36";
 var TMDB_API_KEY = "83d364331c40bfbe29858aeed82f45cc";
-var MAX_SERVERS = 4;
+var MAX_SERVERS = 11;
 
 function fetchText(url, referer) {
   url = String(url).replace(/[^\x00-\x7F]/g, function(c) {
@@ -343,7 +343,7 @@ function resolveServer(server) {
     urlPromise = extractVk(embedUrl);
   } else if (/ok\.ru/.test(host)) {
     urlPromise = extractOk(embedUrl);
-  } else if (/dood|playmogo|uqload|ds2play|vidspeed|bysesukior|mixdrop|hgcloud|voe/.test(host)) {
+  } else if (/dood|playmogo|uqload|ds2play|vidspeed|bysesukior/.test(host)) {
     urlPromise = extractDood(embedUrl);
   } else {
     urlPromise = fetchText(embedUrl, BASE + "/").then(function(html) {
@@ -354,16 +354,16 @@ function resolveServer(server) {
   }
 
   return urlPromise.then(function(items) {
-    if (items.length) {
-      items.sort(function(a, b) { return qualityRankValue(b.quality) - qualityRankValue(a.quality); });
-      var best = items[0];
-      return [makeStream(best.url, server.name, embedUrl, best.quality)];
+    if (!items.length) {
+      console.log("[DramaCafe] no direct URL for", server.name, "- skipping");
+      return [];
     }
-    console.log("[DramaCafe] no direct URL for", server.name, "- using embed fallback");
-    return [makeStream(embedUrl, server.name + " (embed)", embedUrl, "Auto")];
+    items.sort(function(a, b) { return qualityRankValue(b.quality) - qualityRankValue(a.quality); });
+    var best = items[0];
+    return [makeStream(best.url, server.name, embedUrl, best.quality)];
   }).catch(function(err) {
-    console.log("[DramaCafe] server error:", server.name, err.message, "- using embed fallback");
-    return [makeStream(embedUrl, server.name + " (embed)", embedUrl, "Auto")];
+    console.log("[DramaCafe] server error:", server.name, err.message);
+    return [];
   });
 }
 
@@ -374,9 +374,7 @@ function resolveSingleServer(vid) {
     if (!playerUrl) return [];
     return fetchText(playerUrl, embedUrl).then(function(playerHtml) {
       var directUrls = extractStreamsFromPlayer(playerHtml);
-      if (!directUrls.length) {
-        return [makeStream(playerUrl, "Server (embed)", playerUrl, "Auto")];
-      }
+      if (!directUrls.length) return [];
       directUrls.sort(function(a, b) { return qualityRankValue(qualityFromUrl(b)) - qualityRankValue(qualityFromUrl(a)); });
       return [makeStream(directUrls[0], "Server", playerUrl)];
     }).catch(function(err) {
