@@ -1,4 +1,4 @@
-var BASE_URL = 'https://fosta-tv.monster';
+var BASE_URL = 'https://fosta-tv.vip';
 var PROVIDER_ID = 'aravid';
 var PROVIDER_NAME = 'Aravid';
 
@@ -6,7 +6,13 @@ var PROVIDER_NAME = 'Aravid';
 var TMDB_API_KEY = '83d364331c40bfbe29858aeed82f45cc';
 
 // ───────────────────────── Content language filter ─────────────────────
+// 'arabic'  = only Arabic-original content
+// 'english' = only English-original content
+// 'both'    = both Arabic and English content (default)
 var CONTENT_LANG = 'both';
+
+// true  = skip dubbed / subtitled uploads for Arabic content
+//         (zero cross-talk with foreign titles)
 var SKIP_DUB_SUB_ARABIC = true;
 
 var MAX_SEARCH_PAGES = 3;
@@ -637,13 +643,27 @@ function getSeriesStreams(meta, season, episode, title) {
 
 // ──────────────────────── Servers (play.php) ──────────────────────────
 
+// Known streaming-host keywords — used to whitelist candidate URLs.
+var KNOWN_HOST_PATTERN = '1vid|vidmoly|playmogo|uqload|dood|voe|streamtape|filemoon|upstream|mp4upload|sendvid|sibnet|mixdrop|ds2play|vidspeed|ok\\.ru|vk\\.com|vkvideo|hgcloud|vidhide|listeamed';
+
 function fetchEmbedUrls(vid) {
   return siteGet(BASE_URL + '/play.php?vid=' + vid, BASE_URL + '/watch.php?vid=' + vid).then(function (html) {
     var urls = [];
     var seen = {};
     var baseHost = hostOf(BASE_URL);
 
+    // Pre-unescape JS string escapes so URLs stored inside <script> tags
+    // (e.g. "https:\/\/hgcloud.to\/embed-abc.html") become matchable.
+    var text = html
+      .replace(/\\\//g, '/')
+      .replace(/\\u002F/gi, '/')
+      .replace(/\\u0026/gi, '&');
+
     function add(url) {
+      if (!url) return;
+      url = String(url).trim();
+      if (!url) return;
+      if (!/^(?:https?:)?\/\//i.test(url)) return;
       url = absoluteUrl(url, BASE_URL);
       if (!url || seen[url]) return;
       if (hostOf(url) === baseHost) return;
@@ -651,17 +671,41 @@ function fetchEmbedUrls(vid) {
       urls.push(url);
     }
 
-    function collect(re) {
+    function collect(re, source) {
+      source = source || text;
       var m;
-      while ((m = re.exec(html)) !== null) add(m[1]);
+      while ((m = re.exec(source)) !== null) add(m[1]);
     }
 
+    // 1. iframe src
     collect(/<iframe\b[^>]*?\ssrc\s*=\s*["']([^"']+)["']/gi);
-    collect(/data-[a-z0-9_-]+\s*=\s*["'](https?:\/\/[^"']+)["']/gi);
 
-    var reHost = /https?:\/\/[^"'\s<>]*(?:1vid|vidmoly|playmogo|uqload|dood|voe|streamtape|filemoon|upstream|mp4upload|sendvid|sibnet|mixdrop|ds2play|vidspeed|ok\.ru|vk\.com|vkvideo|hgcloud|vidhide|listeamed)[^"'\s<>]*/gi;
-    collect(reHost);
+    // 2. any src / href / data-* attribute holding a URL
+    collect(/\s(?:src|href|data-[a-z0-9_-]+)\s*=\s*["']((?:https?:)?\/\/[^"']+)["']/gi);
 
+    // 3. onclick handlers with a URL inside
+    var onclickRe = /onclick\s*=\s*["']([^"']+)["']/gi;
+    var om;
+    while ((om = onclickRe.exec(text)) !== null) {
+      var innerRe = /(?:https?:)?\/\/[^"'\s<>)]+/gi;
+      var im;
+      while ((im = innerRe.exec(om[1])) !== null) add(im[0]);
+    }
+
+    // 4. any external URL matching a known streaming host, anywhere in the page
+    collect(new RegExp('https?://[^"\'\\s<>]*(?:' + KNOWN_HOST_PATTERN + ')[^"\'\\s<>]*', 'gi'));
+
+    // 5. same whitelist but inside <script> tags (JS-built server lists)
+    var scriptRe = /<script\b[^>]*>([\s\S]*?)<\/script>/gi;
+    var sm;
+    while ((sm = scriptRe.exec(text)) !== null) {
+      var jsText = sm[1];
+      var jsRe = new RegExp('(?:https?:)?//[^"\'\\s<>]*(?:' + KNOWN_HOST_PATTERN + ')[^"\'\\s<>]*', 'gi');
+      var jm;
+      while ((jm = jsRe.exec(jsText)) !== null) add(jm[0]);
+    }
+
+    log('play.php raw candidates: ' + urls.length);
     return urls;
   });
 }
@@ -896,37 +940,29 @@ function qualityRank(q) {
 
 function getServerStreams(vid, title) {
   return fetchEmbedUrls(vid).then(function (embedUrls) {
-    // ★ FIX 1: Limit to MAX_SERVERS (4) to reduce fetch time and avoid duplicate providers.
-    var limitedUrls = embedUrls.slice(0, MAX_SERVERS);
-    log('servers for ' + vid + ': ' + limitedUrls.length + ' (of ' + embedUrls.length + ')');
-    return Promise.all(limitedUrls.map(resolveEmbed));
+    // Honour MAX_SERVERS — this is the knob you can raise/lower at will.
+    var limited = embedUrls.slice(0, MAX_SERVERS);
+    log('servers for ' + vid + ': ' + limited.length + ' of ' + embedUrls.length + ' (MAX_SERVERS=' + MAX_SERVERS + ')');
+    return Promise.all(limited.map(resolveEmbed));
   }).then(function (groups) {
-    // ★ FIX 2: Pick the best-quality stream from each embed URL (one stream per server).
-    var bestPerServer = [];
-    groups.forEach(function (items) {
-      if (!items.length) return;
-      items.sort(function (a, b) { return qualityRank(b.quality) - qualityRank(a.quality); });
-      bestPerServer.push(items[0]);
-    });
-
-    // ★ FIX 3: Deduplicate by server name so each provider appears only once.
     var streams = [];
-    var seenProviders = {};
-    bestPerServer.forEach(function (it) {
-      if (seenProviders[it.server]) return;
-      seenProviders[it.server] = true;
-      streams.push({
-        name: PROVIDER_NAME + ' ' + it.server + (it.quality !== 'Unknown' ? ' ' + it.quality : ''),
-        title: title,
-        url: it.url,
-        quality: it.quality,
-        size: 'Unknown',
-        headers: it.headers,
-        provider: PROVIDER_ID
+    var seen = {};
+    groups.forEach(function (items) {
+      items.forEach(function (it) {
+        if (seen[it.url]) return;
+        seen[it.url] = true;
+        streams.push({
+          name: PROVIDER_NAME + ' ' + it.server + (it.quality !== 'Unknown' ? ' ' + it.quality : ''),
+          title: title,
+          url: it.url,
+          quality: it.quality,
+          size: 'Unknown',
+          headers: it.headers,
+          provider: PROVIDER_ID
+        });
       });
     });
-
-    streams = streams.slice(0, MAX_SERVERS);
+    streams.sort(function (a, b) { return qualityRank(b.quality) - qualityRank(a.quality); });
     return streams;
   });
 }
