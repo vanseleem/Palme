@@ -1,7 +1,7 @@
-var BASE = "https://ddramacafe-tv.bar";
+var BASE = "https://ddramacafe-tv.casa";
 var UA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Mobile Safari/537.36";
 var TMDB_API_KEY = "83d364331c40bfbe29858aeed82f45cc";
-var MAX_SERVERS = 4;
+var MAX_SERVERS = 11;
 
 function fetchText(url, referer) {
   url = String(url).replace(/[^\x00-\x7F]/g, function(c) {
@@ -201,6 +201,69 @@ function extractStreamsFromPlayer(playerHtml) {
   return streams;
 }
 
+function extractDood(embedUrl) {
+  return fetchText(embedUrl, BASE + "/").then(function(html) {
+    var pm = html.match(/["'](\/pass_md5\/[^"']+)["']/i);
+    if (!pm) return [];
+    var tk = pm[1].match(/\/pass_md5\/([^\/?#]+)/);
+    var token = tk ? tk[1] : '';
+    var exm = html.match(/[?&]expiry=([0-9]+)/i);
+    var expiry = exm ? exm[1] : String(Math.floor(Date.now() / 1000) + 3600);
+    var origin = originOf(embedUrl);
+    return fetchText(origin + pm[1], embedUrl).then(function(base) {
+      base = String(base || '').trim();
+      if (!base || base.length < 10 || !/^https?:/i.test(base)) return [];
+      var chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+      var rnd = '';
+      for (var i = 0; i < 10; i++) rnd += chars.charAt(Math.floor(Math.random() * chars.length));
+      return [{ url: base + rnd + '?token=' + token + '&expiry=' + expiry, quality: 'Auto' }];
+    });
+  }).catch(function() { return []; });
+}
+
+function extractVk(embedUrl) {
+  return fetchText(embedUrl, BASE + "/").then(function(html) {
+    var out = [];
+    var re = /"url(\d{3,4})"\s*:\s*"(https?:[^"]+)"/g;
+    var m;
+    while ((m = re.exec(html)) !== null) {
+      out.push({ url: m[2].replace(/\\\//g, '/'), quality: m[1] + 'p' });
+    }
+    if (!out.length) {
+      var hls = /"hls"\s*:\s*"(https?:[^"]+)"/.exec(html);
+      if (hls) out.push({ url: hls[1].replace(/\\\//g, '/'), quality: 'Auto' });
+    }
+    return out;
+  }).catch(function() { return []; });
+}
+
+function extractOk(embedUrl) {
+  return fetchText(embedUrl, BASE + "/").then(function(html) {
+    var out = [];
+    var m = /data-options\s*=\s*"([^"]+)"/.exec(html);
+    if (m) {
+      try {
+        var options = JSON.parse(decodeHtml(m[1]));
+        var meta = options && options.flashvars && options.flashvars.metadata;
+        if (typeof meta === 'string') meta = JSON.parse(meta);
+        if (meta) {
+          (meta.videos || []).forEach(function(v) {
+            if (v && v.url) out.push({ url: v.url, quality: 'Auto' });
+          });
+          var hls = meta.hlsManifestUrl || meta.ondemandHls || meta.hlsMasterPlaylistUrl;
+          if (hls) out.push({ url: hls, quality: 'Auto' });
+          if (out.length) return out;
+        }
+      } catch (e) {}
+    }
+    var mm = /"hlsManifestUrl"\s*:\s*"([^"]+)"/i.exec(html);
+    if (mm) return [{ url: mm[1], quality: 'Auto' }];
+    mm = /"videoUrl"\s*:\s*"([^"]+)"/i.exec(html);
+    if (mm) return [{ url: mm[1], quality: 'Auto' }];
+    return out;
+  }).catch(function() { return []; });
+}
+
 function qualityFromUrl(url) {
   var s = String(url).toLowerCase();
   if (/2160|4k/.test(s)) return "4K";
@@ -212,12 +275,26 @@ function qualityFromUrl(url) {
   return "Unknown";
 }
 
+function qualityRankValue(q) {
+  if (q === "4K") return 4;
+  if (q === "1440p") return 3;
+  if (q === "1080p") return 2;
+  if (q === "720p") return 1;
+  if (q === "Auto") return 2;
+  return 0;
+}
+
 function originOf(url) {
   var m = String(url || "").match(/^(https?:\/\/[^\/]+)/i);
   return m ? m[1] : "";
 }
 
-function makeStream(url, label, playerUrl) {
+function hostOf(url) {
+  var m = String(url || "").match(/^https?:\/\/([^\/?#:]+)/i);
+  return m ? m[1].toLowerCase() : "";
+}
+
+function makeStream(url, label, playerUrl, quality) {
   var origin = originOf(playerUrl) || BASE;
   var streamReferer = origin + "/";
 
@@ -229,7 +306,7 @@ function makeStream(url, label, playerUrl) {
     name: "DramaCafe",
     title: label ? "DramaCafe \u2022 " + label : "DramaCafe",
     url: url,
-    quality: qualityFromUrl(url),
+    quality: quality || qualityFromUrl(url),
     referer: streamReferer,
     headers: {
       "User-Agent": UA,
@@ -240,13 +317,10 @@ function makeStream(url, label, playerUrl) {
   };
 }
 
-// ─────────────────────────────────────────────────────────────────────
-// Parse all servers from the play page
-// ─────────────────────────────────────────────────────────────────────
 function parseServers(html) {
   var servers = [];
   var seen = {};
-  var liRegex = /<li[^>]*data-embed-url=["']([^"']+)["'][^>]*>([\s\S]*?)<\/li>/gi;
+  var liRegex = /<li[^>]*data-embed-\s*url\s*=\s*["']([^"']+)["'][^>]*>([\s\S]*?)<\/li>/gi;
   var m;
   while ((m = liRegex.exec(html)) !== null) {
     var url = decodeHtml(m[1]);
@@ -260,31 +334,39 @@ function parseServers(html) {
   return servers;
 }
 
-// ─────────────────────────────────────────────────────────────────────
-// Resolve a single server — ONLY returns direct m3u8/mp4.
-// If nothing extractable is found, returns [] (no dead iframe entries).
-// ─────────────────────────────────────────────────────────────────────
 function resolveServer(server) {
   var embedUrl = server.url;
-  return fetchText(embedUrl, BASE + "/").then(function(playerHtml) {
-    var directUrls = extractStreamsFromPlayer(playerHtml);
-    if (directUrls.length) {
-      return directUrls.map(function(u, i) {
-        var label = server.name + (directUrls.length > 1 ? " #" + (i + 1) : "");
-        return makeStream(u, label, embedUrl);
+  var host = hostOf(embedUrl);
+
+  var urlPromise;
+  if (/vk\.com|vkvideo\.ru/.test(host)) {
+    urlPromise = extractVk(embedUrl);
+  } else if (/ok\.ru/.test(host)) {
+    urlPromise = extractOk(embedUrl);
+  } else if (/dood|playmogo|uqload|ds2play|vidspeed|bysesukior/.test(host)) {
+    urlPromise = extractDood(embedUrl);
+  } else {
+    urlPromise = fetchText(embedUrl, BASE + "/").then(function(html) {
+      return extractStreamsFromPlayer(html).map(function(u) {
+        return { url: u, quality: qualityFromUrl(u) };
       });
+    });
+  }
+
+  return urlPromise.then(function(items) {
+    if (!items.length) {
+      console.log("[DramaCafe] no direct URL for", server.name, "- skipping");
+      return [];
     }
-    console.log("[DramaCafe] no direct URL for", server.name, "- skipping");
-    return [];
+    items.sort(function(a, b) { return qualityRankValue(b.quality) - qualityRankValue(a.quality); });
+    var best = items[0];
+    return [makeStream(best.url, server.name, embedUrl, best.quality)];
   }).catch(function(err) {
     console.log("[DramaCafe] server error:", server.name, err.message);
     return [];
   });
 }
 
-// ─────────────────────────────────────────────────────────────────────
-// Fallback — old single-server path, but also only returns direct URLs
-// ─────────────────────────────────────────────────────────────────────
 function resolveSingleServer(vid) {
   var embedUrl = buildEmbedUrl(vid);
   return fetchText(embedUrl, BASE + "/").then(function(embedHtml) {
@@ -293,9 +375,8 @@ function resolveSingleServer(vid) {
     return fetchText(playerUrl, embedUrl).then(function(playerHtml) {
       var directUrls = extractStreamsFromPlayer(playerHtml);
       if (!directUrls.length) return [];
-      return directUrls.map(function(u, i) {
-        return makeStream(u, "Server " + (i + 1), playerUrl);
-      });
+      directUrls.sort(function(a, b) { return qualityRankValue(qualityFromUrl(b)) - qualityRankValue(qualityFromUrl(a)); });
+      return [makeStream(directUrls[0], "Server", playerUrl)];
     }).catch(function(err) {
       console.log("[DramaCafe] fallback player error:", err.message);
       return [];
@@ -306,10 +387,6 @@ function resolveSingleServer(vid) {
   });
 }
 
-// ─────────────────────────────────────────────────────────────────────
-// resolveVid — fetches play.php, resolves every server, returns only
-// streams that resolve to a direct m3u8/mp4.
-// ─────────────────────────────────────────────────────────────────────
 function resolveVid(vid) {
   var playUrl = BASE + "/play.php?vid=" + vid;
   console.log("[DramaCafe] play:", playUrl);
@@ -325,6 +402,7 @@ function resolveVid(vid) {
     })).then(function(groups) {
       var all = [];
       groups.forEach(function(g) { all = all.concat(g); });
+      all = all.slice(0, MAX_SERVERS);
       console.log("[DramaCafe] working streams:", all.length);
       if (!all.length) {
         console.log("[DramaCafe] none extracted, trying single-server fallback");
