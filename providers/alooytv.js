@@ -20,7 +20,7 @@ var __async = (__this, __arguments, generator) => {
   });
 };
 const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36";
-const DOMAIN = "https://dm.alooytv16.xyz";
+const DOMAIN = "https://es.alooytv16.xyz";
 const TMDB_API_KEY = "83d364331c40bfbe29858aeed82f45cc";
 function decodeHtml(str) {
   return String(str).replace(/&amp;/gi, "&").replace(/&quot;/gi, '"').replace(/&#39;/gi, "'").replace(/&#x27;/gi, "'").replace(/&lt;/gi, "<").replace(/&gt;/gi, ">");
