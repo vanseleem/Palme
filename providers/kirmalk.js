@@ -1,17 +1,16 @@
 var BASE_URL = 'https://kirmalk.com';
 var TMDB_API_KEY = '83d364331c40bfbe29858aeed82f45cc';
 var DEBUG = true;
-// When no stream is found, return ONE fake entry whose title is the failure trace, so it is visible inside Nuvio.
 var DEBUG_STREAM = true;
 
 var MAX_SEARCH_PAGES = 3;
 var MAX_QUERIES = 6;
 var MAX_GROUPS = 4;
 var MAX_MOVIE_CANDIDATES = 4;
-// Max servers resolved per episode/movie (the site lists 4; the extra slots are for stray player URLs).
 var MAX_SERVERS = 6;
 var SITE_TIMEOUT = 15000;
 var HOST_TIMEOUT = 15000;
+var GRACE_MS = 2500;
 
 var UA_SITE = 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Mobile Safari/537.36';
 var UA_HOST = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
@@ -48,7 +47,6 @@ function toWesternDigits(str) {
     .replace(/[\u06F0-\u06F9]/g, function (c) { return String(c.charCodeAt(0) - 0x06F0); });
 }
 
-// Lower-case, fold Arabic letter variants, drop diacritics and punctuation.
 function normalizeText(input) {
   var s = toWesternDigits(decodeEntities(input)).toLowerCase();
   if (typeof s.normalize === 'function') {
@@ -66,7 +64,6 @@ function normalizeText(input) {
   return s.replace(/[^\u0621-\u064Aa-z0-9]+/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
-// Search-box text: keep letters/digits, drop punctuation (boolean full-text dislikes it).
 function cleanQuery(text) {
   return decodeEntities(text)
     .replace(/[\u060C\u061B\u061F\u066A-\u066D\u06D4]/g, ' ')
@@ -75,7 +72,6 @@ function cleanQuery(text) {
     .trim();
 }
 
-// Same text, but alef/diacritic variants folded (used as a fallback query).
 function foldQuery(text) {
   return cleanQuery(text)
     .replace(/[\u064B-\u065F\u0670\u0640]/g, '')
@@ -118,8 +114,6 @@ function numberFromToken(token) {
   return ORDINALS[token] || null;
 }
 
-// "مسلسل الاعراف 2 الحلقة 26 السادسة والعشرون مدبلجة HD"  -> series info
-// "مشاهدة فيلم برشامة 2026 HD"                              -> movie info
 function parseTitle(raw) {
   var info = { kind: null, name: '', aliases: [], year: null, season: null, episode: null, variant: '' };
   var aliases = [];
@@ -281,7 +275,6 @@ function getAttr(tag, name) {
   return m ? (m[1] !== undefined ? m[1] : m[2]) : '';
 }
 
-// Every <a href="...watch.php?vid=ID" title="..."> on a page, de-duplicated by vid.
 function parseWatchAnchors(html) {
   var byVid = {};
   var out = [];
@@ -313,7 +306,6 @@ function parseMaxPage(html) {
   return max;
 }
 
-// "المواسم والحلقات" block: anchors whose text is "N حلقة" -> watch.php?vid=ID
 function parseEpisodeList(html) {
   var list = [];
   var seenEp = {};
@@ -405,7 +397,6 @@ function buildMeta(tm, type) {
     year: isNaN(year) ? null : year,
     titles: arabicFirst,
     targets: uniqueBy(arabicFirst.map(normalizeText), function (x) { return x; }),
-    // Episodes that come before season S (for continuous numbering on the site).
     priorEpisodes: function (S) {
       var total = 0;
       for (var s = 1; s < S; s++) {
@@ -444,7 +435,6 @@ function searchPage(query, page) {
   return siteGet(url).then(function (html) {
     var entries = parseWatchAnchors(html);
     if (entries.length || page > 1) return { entries: entries, maxPage: parseMaxPage(html) };
-    // Fallback parameter name in case "keywords" returned nothing at all.
     var alt = BASE_URL + '/search.php?q=' + encodeURIComponent(query);
     return siteGet(alt).then(function (h2) {
       return { entries: parseWatchAnchors(h2), maxPage: parseMaxPage(h2) };
@@ -452,7 +442,6 @@ function searchPage(query, page) {
   });
 }
 
-// onEntries(entries) returns true to stop everything.
 function searchPages(query, onEntries) {
   var page = 1;
   function step() {
@@ -502,9 +491,6 @@ function randomString(len) {
   return out;
 }
 
-// DoodStream-style player page:
-//   $.get('/pass_md5/<id>/<token>', d => src = d + makePlay())
-//   makePlay() = <10 random chars> + "?token=<token>&expiry=" + Date.now()
 function doodMediaFromPage(html, pageUrl) {
   var media = extractMedia(html, pageUrl, true);
   if (media.length) return Promise.resolve(media);
@@ -560,7 +546,6 @@ function unpackOne(payload, radix, keyStr) {
   });
 }
 
-// Dean Edwards packer: eval(function(p,a,c,k,e,d){...}('payload',radix,count,'a|b'.split('|'),0,{}))
 function unpackAll(text) {
   var results = [];
   var current = text;
@@ -594,7 +579,6 @@ function mediaRank(url) {
   return 2;
 }
 
-// Direct stream URLs (m3u8 / mp4) inside a page, including packed player scripts.
 function extractMedia(html, pageUrl, strict) {
   var texts = [html].concat(unpackAll(html));
   var found = [];
@@ -631,7 +615,6 @@ function extractMedia(html, pageUrl, strict) {
     .map(function (x) { return x.u; });
 }
 
-// External player / embed URLs referenced by a page.
 function extractHostUrls(html, pageUrl, loose) {
   var urls = [];
   function add(u) {
@@ -673,12 +656,10 @@ function isSiteUrl(url) {
   return hostOf(url) === hostOf(BASE_URL);
 }
 
-// Loose URL scans pick up everything; keep only what looks like a player / embed page.
 function looksLikePlayerUrl(url) {
   return isDoodHost(url) || /embed|\/[evd]\/|player|iframe|stream|\.html?(?:[?#]|$)/i.test(url);
 }
 
-// One attribute value / onclick string of a server button -> absolute URL ('' when it is not a URL).
 function serverUrlFromValue(val, pageUrl) {
   var v = decodeEntities(val).replace(/\\\//g, '/').trim();
   if (!v || v.charAt(0) === '#') return '';
@@ -693,8 +674,6 @@ function serverUrlFromValue(val, pageUrl) {
   return '';
 }
 
-// view.php shows the servers as buttons ("سيرفر 1" ... "سيرفر 4"); read the URL each button carries
-// in its own attributes / onclick (absolute, relative to the site, or base64).
 function extractServerButtons(html, pageUrl) {
   var out = [];
   if (!/(?:سيرفر|server)\s*[\d\u0660-\u0669]/i.test(html)) return out;
@@ -740,7 +719,6 @@ function resolveHost(hostUrl, referer, depth) {
   var h = hostOf(hostUrl);
   var dood = isDoodHost(hostUrl);
 
-  // First hop must look like the iframe on kirmalk.com (embeds are whitelisted per referring site).
   return fetchText(hostUrl, {
     'User-Agent': UA_HOST,
     'Referer': depth === 0 ? BASE_URL + '/' : referer,
@@ -821,31 +799,73 @@ function buildStreams(resolved, label, tag) {
   return streams;
 }
 
-// One server entry -> [{ pageUrl, media: [direct urls] }] (empty when it cannot be resolved).
-function resolveServer(srv) {
-  if (srv.media) return Promise.resolve([{ pageUrl: srv.url, media: srv.media }]);
-  if (!isSiteUrl(srv.url)) return resolveHost(srv.url, BASE_URL + '/', 0);
+// ─────────────────────────── Grace-window race ───────────────────────────
+// Resolves when ALL promises finish OR when GRACE_MS has elapsed after the
+// first non-empty result arrives — whichever comes first.
+// Slots that have not finished by then contribute an empty array.
 
-  // The button points back at a kirmalk page that holds the player.
-  return siteGet(srv.url, BASE_URL + '/').then(function (html) {
-    var direct = extractMedia(html, srv.url, false);
-    if (direct.length) return [{ pageUrl: srv.url, media: direct }];
-    var hosts = extractHostUrls(html, srv.url, false);
-    if (!hosts.length) hosts = extractHostUrls(html, srv.url, true).filter(looksLikePlayerUrl);
-    return sequentialFirst(rankHosts(hosts).slice(0, 3), function (h) { return resolveHost(h, srv.url, 0); });
-  }).catch(function (err) {
-    log('server page failed: ' + (err && err.message));
-    return [];
+function raceWithGrace(promises) {
+  return new Promise(function (resolve) {
+    var total = promises.length;
+    if (!total) { resolve([]); return; }
+
+    var results  = new Array(total);
+    var finished = new Array(total);
+    var firstAt  = null;
+    var graceTimer = null;
+    var settled  = false;
+
+    for (var k = 0; k < total; k++) results[k] = [];
+
+    function trySettle() {
+      if (settled) return;
+      var allDone = finished.every(Boolean);
+      if (allDone) {
+        settled = true;
+        if (graceTimer) clearTimeout(graceTimer);
+        resolve(results);
+        return;
+      }
+      if (firstAt !== null && !graceTimer) {
+        var elapsed   = Date.now() - firstAt;
+        var remaining = Math.max(0, GRACE_MS - elapsed);
+        log('grace window: ' + remaining + 'ms remaining for slow servers');
+        graceTimer = setTimeout(function () {
+          if (settled) return;
+          settled = true;
+          var dropped = finished.reduce(function (n, f) { return n + (f ? 0 : 1); }, 0);
+          if (dropped) log('grace expired — dropped ' + dropped + ' slow/dead server(s)');
+          resolve(results);
+        }, remaining);
+      }
+    }
+
+    promises.forEach(function (p, i) {
+      Promise.resolve(p).then(function (val) {
+        results[i]  = val || [];
+        finished[i] = true;
+        if (results[i].length && firstAt === null) {
+          firstAt = Date.now();
+          log('first stream from server slot #' + (i + 1) + ', grace window of ' + GRACE_MS + 'ms started');
+        }
+        trySettle();
+      }).catch(function (err) {
+        log('server slot #' + (i + 1) + ' error: ' + (err && err.message));
+        finished[i] = true;
+        trySettle();
+      });
+    });
   });
 }
 
-// Every server the site offers for one vid: view.php lists them as "سيرفر 1..4", embed.php exposes one URL.
+// ─────────────────────────── Server collection ───────────────────────────
+
 function collectServers(vid) {
   var watchUrl = BASE_URL + '/watch.php?vid=' + vid;
-  var viewUrl = BASE_URL + '/view.php?vid=' + vid;
+  var viewUrl  = BASE_URL + '/view.php?vid='  + vid;
   var embedUrl = BASE_URL + '/embed.php?vid=' + vid;
-  var servers = [];
-  var seen = {};
+  var servers  = [];
+  var seen     = {};
 
   function add(url, n, media) {
     var key = url + (media ? '|direct' : '');
@@ -856,8 +876,8 @@ function collectServers(vid) {
 
   var viewP = siteGet(viewUrl, watchUrl).then(function (html) {
     var buttons = extractServerButtons(html, viewUrl);
-    var frames = extractHostUrls(html, viewUrl, false);
-    var extra = extractHostUrls(html, viewUrl, true).filter(looksLikePlayerUrl);
+    var frames  = extractHostUrls(html, viewUrl, false);
+    var extra   = extractHostUrls(html, viewUrl, true).filter(looksLikePlayerUrl);
     log('view.php: ' + buttons.length + ' button url(s), ' + frames.length + ' frame(s), ' + extra.length + ' player-like url(s)');
     return { buttons: buttons, urls: frames.concat(extra) };
   }).catch(function (err) {
@@ -874,12 +894,11 @@ function collectServers(vid) {
 
   return Promise.all([viewP, embedP]).then(function (r) {
     r[0].buttons.forEach(function (b) { add(b.url, b.n, null); });
-    r[0].urls.forEach(function (u) { add(u, null, null); });
+    r[0].urls.forEach(function (u)    { add(u, null, null); });
     if (r[1].media.length) add(embedUrl, null, r[1].media);
-    r[1].urls.forEach(function (u) { add(u, null, null); });
+    r[1].urls.forEach(function (u)    { add(u, null, null); });
     if (servers.length) return servers;
 
-    // Nothing on view.php / embed.php: last resort is the watch page itself.
     return siteGet(watchUrl, BASE_URL + '/').then(function (html) {
       var direct = extractMedia(html, watchUrl, true);
       if (direct.length) add(watchUrl, null, direct);
@@ -897,36 +916,57 @@ function serverTag(srv, resolved) {
   return (srv.n ? 'Server ' + srv.n + ' \u2022 ' : '') + (host || 'direct');
 }
 
-// vid -> every server (view.php buttons / iframe, embed.php) -> host player -> direct stream(s), one entry per server
+// ─────────────────────────── resolveVid (updated) ────────────────────────
+
 function resolveVid(vid, label) {
   return collectServers(vid).then(function (servers) {
     var targets = servers.slice(0, MAX_SERVERS);
     log('vid ' + vid + ' -> ' + servers.length + ' server(s), resolving ' + targets.length);
-    return Promise.all(targets.map(function (srv, i) {
+
+    var serverPromises = targets.map(function (srv, i) {
       return resolveServer(srv).then(function (resolved) {
         var links = resolved.reduce(function (sum, r) { return sum + r.media.length; }, 0);
         log('server ' + (srv.n || ('#' + (i + 1))) + ' (' + (hostOf(srv.url) || 'direct') + ') -> ' + links + ' link(s)');
         return buildStreams(resolved, label, serverTag(srv, resolved));
       });
-    }));
-  }).then(function (groups) {
-    var streams = [];
-    var seen = {};
-    groups.forEach(function (group) {
-      group.forEach(function (s) {
-        if (seen[s.url]) return;
-        seen[s.url] = true;
-        streams.push(s);
-      });
     });
-    log('vid ' + vid + ' -> ' + streams.length + ' stream(s)');
-    return streams;
+
+    return raceWithGrace(serverPromises).then(function (groups) {
+      var streams = [];
+      var seen = {};
+      groups.forEach(function (group) {
+        group.forEach(function (s) {
+          if (seen[s.url]) return;
+          seen[s.url] = true;
+          streams.push(s);
+        });
+      });
+      log('vid ' + vid + ' -> ' + streams.length + ' stream(s)');
+      return streams;
+    });
+  });
+}
+
+// ─────────────────────────── resolveServer ───────────────────────────────
+
+function resolveServer(srv) {
+  if (srv.media) return Promise.resolve([{ pageUrl: srv.url, media: srv.media }]);
+  if (!isSiteUrl(srv.url)) return resolveHost(srv.url, BASE_URL + '/', 0);
+
+  return siteGet(srv.url, BASE_URL + '/').then(function (html) {
+    var direct = extractMedia(html, srv.url, false);
+    if (direct.length) return [{ pageUrl: srv.url, media: direct }];
+    var hosts = extractHostUrls(html, srv.url, false);
+    if (!hosts.length) hosts = extractHostUrls(html, srv.url, true).filter(looksLikePlayerUrl);
+    return sequentialFirst(rankHosts(hosts).slice(0, 3), function (h) { return resolveHost(h, srv.url, 0); });
+  }).catch(function (err) {
+    log('server page failed: ' + (err && err.message));
+    return [];
   });
 }
 
 // ───────────────────────────────── Movies ───────────────────────────────
 
-// Returns null when the upload is not this movie, otherwise a score.
 function scoreMovieEntry(entry, meta) {
   var info = parseTitle(entry.title);
   if (info.kind !== 'movie') return null;
@@ -956,7 +996,7 @@ function scoreMovieEntry(entry, meta) {
 
 function movieStreams(meta) {
   var found = [];
-  var seen = {};
+  var seen  = {};
 
   function onEntries(entries) {
     var confident = false;
@@ -983,7 +1023,6 @@ function movieStreams(meta) {
 
 // ───────────────────────────────── Series ───────────────────────────────
 
-// Exact name, name + trailing season digit ("الاعراف 2"), then a strict fuzzy fallback.
 function matchSeriesName(info, targets) {
   var names = [info.name].concat(info.aliases).filter(Boolean);
   var ni, ti, n, t, tm;
@@ -1022,7 +1061,6 @@ function findEpisodeOnPage(group, targetEp) {
     var hit = list.filter(function (x) { return x.episode === targetEp; })[0];
     if (hit) return hit.vid;
     if (list.length) return null;
-    // Fallback when the list block is missing: titles on the page for the same series + variant.
     var vid = null;
     parseWatchAnchors(html).forEach(function (a) {
       if (vid) return;
@@ -1061,7 +1099,7 @@ function resolveGroup(group, S, E, meta) {
 
 function tvStreams(meta, S, E) {
   var groups = {};
-  var order = [];
+  var order  = [];
 
   function usable() {
     return order.some(function (k) {
@@ -1078,8 +1116,8 @@ function tvStreams(meta, S, E) {
       var m = matchSeriesName(info, meta.targets);
       if (!m) return;
       var season = info.season || m.trailing || null;
-      var key = m.base + '|' + (season || 0) + '|' + info.variant;
-      var g = groups[key];
+      var key    = m.base + '|' + (season || 0) + '|' + info.variant;
+      var g      = groups[key];
       if (!g) {
         g = groups[key] = { base: m.base, season: season, variant: info.variant, entries: [], seen: {}, absolute: false };
         order.push(key);
@@ -1093,9 +1131,9 @@ function tvStreams(meta, S, E) {
   }
 
   return searchQueries(buildQueries(meta, S), onEntries, null).then(function () {
-    var all = order.map(function (k) { return groups[k]; });
-    var exact = all.filter(function (g) { return g.season === S; });
-    var plain = all.filter(function (g) { return g.season === null && S === 1; });
+    var all      = order.map(function (k) { return groups[k]; });
+    var exact    = all.filter(function (g) { return g.season === S; });
+    var plain    = all.filter(function (g) { return g.season === null && S === 1; });
     var absolute = [];
     if (!exact.length && !plain.length && S > 1) {
       absolute = all.filter(function (g) { return g.season === null; });
@@ -1106,7 +1144,7 @@ function tvStreams(meta, S, E) {
       return g.base + ' s' + (g.season || '-') + ' ' + (g.variant || 'ar') + (g.absolute ? ' (abs)' : '');
     }).join(' | '));
 
-    var acc = [];
+    var acc       = [];
     var successes = 0;
     function nextGroup(i) {
       if (i >= list.length || successes >= 2) return Promise.resolve(acc);
@@ -1123,7 +1161,7 @@ function tvStreams(meta, S, E) {
 
 function debugStreams(reason) {
   if (!DEBUG_STREAM) return [];
-  var lines = TRACE.slice(-9).map(function (l) { return l.length > 110 ? l.slice(0, 110) + '…' : l; });
+  var lines = TRACE.slice(-9).map(function (l) { return l.length > 110 ? l.slice(0, 110) + '\u2026' : l; });
   return [{
     name: 'Kirmalk DEBUG',
     title: ('NO STREAMS (' + reason + ')\n' + lines.join('\n')).slice(0, 900),
@@ -1140,7 +1178,7 @@ function getStreams(tmdbId, mediaType, season, episode) {
   var type = mediaType === 'movie' ? 'movie' : mediaType === 'tv' ? 'tv' : null;
   if (!type) return Promise.resolve([]);
 
-  var S = parseInt(season, 10);
+  var S = parseInt(season,  10);
   var E = parseInt(episode, 10);
   if (type === 'tv' && !(S >= 1 && E >= 1)) return Promise.resolve([]);
 
