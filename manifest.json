@@ -133,7 +133,7 @@
     },
     {
       "id": "alooytv",
-      "name": "AlooyTV",
+      "name": " 🟠 AlooyTV",
       "description": "Arabic TV streaming provider",
       "version": "1.0.0",
       "author": "vanseleem",
@@ -147,7 +147,7 @@
     },
     {
       "id": "laroza",
-      "name": "Laroza",
+      "name": "🌹 Laroza",
       "description": "Arabic movies and series from Laroza",
       "version": "1.0.0",
       "author": "vanseleem",
@@ -161,7 +161,7 @@
     },
     {
       "id": "dramacafe",
-      "name": "DramaCafe",
+      "name": "☕ DramaCafe",
       "description": "Arabic movies and series from DramaCafe",
       "version": "1.0.0",
       "author": "vanseleem",
@@ -175,7 +175,7 @@
     },
     {
       "id": "ahwaktv",
-      "name": "AhwakTV",
+      "name": " 🤍 AhwakTV",
       "description": "Arabic and international movies and TV series",
       "version": "1.0.0",
       "author": "vanseleem",
@@ -189,7 +189,7 @@
     },
     {
       "id": "aravid",
-      "name": "Aravid",
+      "name": "🎬 Aravid",
       "description": "Arabic movies and series",
       "version": "1.0.0",
       "author": "vanseleem",
@@ -203,7 +203,7 @@
     },
     {
       "id": "qdrama",
-      "name": "QDrama",
+      "name": "🎭 QDrama",
       "description": "Arabic and international drama streaming",
       "version": "1.0.0",
       "author": "vanseleem",
@@ -217,7 +217,7 @@
     },
     {
       "id": "qfilm",
-      "name": "QFilm",
+      "name": "🎭 QFilm",
       "description": "Arabic movies and series from QFilm",
       "version": "1.0.0",
       "author": "vanseleem",
@@ -231,7 +231,7 @@
     },
     {
       "id": "akwam",
-      "name": "Akwam",
+      "name": "🏅 Akwam",
       "description": "Arabic movie and TV streaming provider",
       "version": "1.0.0",
       "author": "vanseleem",
