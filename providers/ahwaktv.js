@@ -1,6 +1,6 @@
 var BASE_URL = 'https://yam.ahwaktv.net';
 var PROVIDER_ID = 'ahwaktv';
-var PROVIDER_NAME = '🎖️ AhwakTV';
+var PROVIDER_NAME = 'AhwakTV';
 
 // Free key from https://www.themoviedb.org/settings/api
 var TMDB_API_KEY = '83d364331c40bfbe29858aeed82f45cc';
@@ -18,6 +18,7 @@ var SKIP_DUB_SUB_ARABIC = true;
 var MAX_SEARCH_PAGES = 3;
 var MAX_MOVIE_CANDIDATES = 3;
 var MAX_EPISODE_CANDIDATES = 2;
+var MAX_SERVERS = 4;
 var SITE_TIMEOUT = 15000;
 var EMBED_TIMEOUT = 12000;
 
