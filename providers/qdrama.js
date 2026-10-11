@@ -263,20 +263,19 @@ function harvestMirrors(html) {
   var text = cleanEscapes(html);
   var m;
 
-  var reData = /data-embed-\s*url\s*=\s*["']([^"']+)["']/gi;
-  while ((m = reData.exec(text)) !== null) {
-    add(rawMirror(m[1]) || normalizeMirror(m[1]));
-  }
-
-  var reOpt = /<option[^>]+value=["']([^"']+)["'][^>]*>/gi;
-  while ((m = reOpt.exec(text)) !== null) {
-    if (m[1].indexOf("http") !== 0) continue;
-    add(rawMirror(m[1]) || normalizeMirror(m[1]));
+  var reServers = /var\s+servers\s*=\s*\[([\s\S]*?)\];/i;
+  var srvMatch = reServers.exec(text);
+  if (srvMatch) {
+    var srvText = srvMatch[1];
+    var reIfSrc = /src=\\?"([^"\\]+)\\?"/gi;
+    while ((m = reIfSrc.exec(srvText)) !== null) {
+      add(rawMirror(m[1]) || normalizeMirror(m[1]));
+    }
   }
 
   var reIf = /<iframe[^>]+src=["']([^"']+)["']/gi;
   while ((m = reIf.exec(text)) !== null) {
-    add(normalizeMirror(m[1]) || rawMirror(m[1]));
+    add(rawMirror(m[1]) || normalizeMirror(m[1]));
   }
 
   var urls = [];
@@ -288,7 +287,9 @@ function harvestMirrors(html) {
     if (dec && dec.indexOf("//") !== -1) collectUrls(cleanEscapes(dec), urls);
   }
 
-  urls.forEach(function(u) { add(normalizeMirror(u)); });
+  urls.forEach(function(u) {
+    add(rawMirror(u) || normalizeMirror(u));
+  });
   return out;
 }
 
@@ -410,34 +411,18 @@ function resolveMirror(mir, referer) {
 
 function resolveVid(vid) {
   var embedUrl = buildEmbedUrl(vid);
-  var pages = [
-    embedUrl,
-    BASE + "/watch.php?vid=" + vid,
-    BASE + "/play.php?vid=" + vid
-  ];
-  console.log("[QDrama] embed:", embedUrl);
+  var playUrl = BASE + "/play.php?vid=" + vid;
+  console.log("[QDrama] play:", playUrl);
 
-  return Promise.all(pages.map(function(p) {
-    return fetchText(p, BASE + "/").catch(function(err) {
-      console.log("[QDrama] page failed:", p, err.message);
-      return "";
-    });
-  })).then(function(htmls) {
-    var mirrors = [];
-    var seen = {};
-    htmls.forEach(function(h) {
-      harvestMirrors(h).forEach(function(mir) {
-        var k = mir.embed.toLowerCase();
-        if (seen[k]) return;
-        seen[k] = 1;
-        mirrors.push(mir);
-      });
-    });
+  return fetchText(playUrl, BASE + "/").then(function(html) {
+    var mirrors = harvestMirrors(html);
     console.log("[QDrama] mirrors found:", mirrors.length, "->", mirrors.map(function(x) { return x.label; }).join(", "));
     if (!mirrors.length) return [];
 
+    mirrors = mirrors.slice(0, MAX_SERVERS);
+
     return Promise.all(mirrors.map(function(mir) {
-      return withTimeout(resolveMirror(mir, embedUrl), MIRROR_TIMEOUT, { mirror: mir, streams: [] });
+      return withTimeout(resolveMirror(mir, playUrl), MIRROR_TIMEOUT, { mirror: mir, streams: [] });
     })).then(function(results) {
       var streams = [];
       var seenHosts = {};
@@ -465,11 +450,14 @@ function resolveVid(vid) {
           url: r.mirror.embed,
           quality: "Auto",
           type: "iframe",
-          referer: embedUrl
+          referer: playUrl
         });
       });
       return fallbacks.slice(0, MAX_SERVERS);
     });
+  }).catch(function(err) {
+    console.log("[QDrama] play.php failed:", err.message);
+    return [];
   });
 }
 
