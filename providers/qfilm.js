@@ -1,8 +1,8 @@
 var BASE = "https://a.qfilm.tv";
 var UA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Mobile Safari/537.36";
 var TMDB_API_KEY = "83d364331c40bfbe29858aeed82f45cc";
-var MAX_SERVERS = 3;
 var MIRROR_TIMEOUT = 15000;
+var MAX_PROVIDERS = 20;
 var BAD_HOST = /(^|\.)(qfilm\.tv|facebook\.com|twitter\.com|google\.com|googleapis\.com|gstatic\.com|w3\.org|schema\.org|cloudflare\.com|jquery\.com|jsdelivr\.net|t\.me|telegram\.org|themoviedb\.org)$/i;
 
 function fetchText(url, referer) {
@@ -45,6 +45,7 @@ function cleanEscapes(s) {
     .replace(/\\u002F/gi, "/")
     .replace(/\\u0026/gi, "&")
     .replace(/\\\//g, "/")
+    .replace(/\\"/g, '"')
     .replace(/&amp;/g, "&");
 }
 
@@ -113,22 +114,18 @@ function scoreResult(r, titles, year) {
   return s;
 }
 
-function getTmdbTitles(tmdbId, mediaType) {
-  var type = mediaType === "tv" ? "tv" : "movie";
+function getTmdbTitles(tmdbId) {
   var langs = ["ar", "en"];
   var titles = [];
   var year = null;
 
   return langs.reduce(function(chain, lang) {
     return chain.then(function() {
-      var apiUrl = "https://api.themoviedb.org/3/" + type + "/" + encodeURIComponent(tmdbId) + "?api_key=" + TMDB_API_KEY + "&language=" + lang;
+      var apiUrl = "https://api.themoviedb.org/3/movie/" + encodeURIComponent(tmdbId) + "?api_key=" + TMDB_API_KEY + "&language=" + lang;
       return fetch(apiUrl).then(function(r) { return r.json(); }).then(function(data) {
-        var title = type === "movie" ? (data.title || data.original_title) : (data.name || data.original_name);
+        var title = data.title || data.original_title;
         if (title && titles.indexOf(title) === -1) titles.push(title);
-        if (!year) {
-          var dateStr = type === "movie" ? data.release_date : data.first_air_date;
-          if (dateStr) year = dateStr.slice(0, 4);
-        }
+        if (!year && data.release_date) year = data.release_date.slice(0, 4);
       }).catch(function() {});
     });
   }, Promise.resolve()).then(function() {
@@ -183,10 +180,6 @@ function chooseResult(results, titles, year) {
   return bestScore >= 0.3 ? best : null;
 }
 
-function buildEmbedUrl(vid) {
-  return BASE + "/embed.php?vid=" + vid;
-}
-
 function hostLabel(host) {
   var parts = String(host).replace(/^www\./, "").split(".");
   var name = parts.length > 1 ? parts[parts.length - 2] : parts[0];
@@ -195,10 +188,16 @@ function hostLabel(host) {
 
 function rawMirror(raw) {
   var u = cleanEscapes(raw).trim();
+  if (!u) return null;
   if (u.indexOf("//") === 0) u = "https:" + u;
+  if (u.charAt(0) === "/") u = BASE + u;
+  if (!/^https?:\/\//i.test(u)) return null;
   var m = u.match(/^https?:\/\/([^\/?#:]+)/i);
-  if (!m || BAD_HOST.test(m[1])) return null;
-  return { embed: u, host: m[1].toLowerCase(), label: hostLabel(m[1]) };
+  if (!m) return null;
+  var host = m[1].toLowerCase();
+  if (BAD_HOST.test(host)) return null;
+  if (/\.(?:jpe?g|png|gif|webp|svg|ico|css|js|woff2?|ttf)(?:\?|$)/i.test(u)) return null;
+  return { embed: u, host: host, label: hostLabel(host) };
 }
 
 function collectUrls(text, out) {
@@ -228,20 +227,34 @@ function harvestMirrors(html) {
   var text = cleanEscapes(html);
   var m;
 
+  // 1. <option value="URL"> inside <select id="server-select"> (embed.php)
   var reOpt = /<option[^>]+value=["']([^"']+)["'][^>]*>/gi;
   while ((m = reOpt.exec(text)) !== null) {
-    if (m[1].indexOf("http") !== 0) continue;
     add(rawMirror(m[1]));
   }
 
+  // 2. var servers = [...] array with escaped iframe HTML (play.php)
+  var reServers = /var\s+servers\s*=\s*\[([\s\S]*?)\];/i;
+  var srvMatch = reServers.exec(text);
+  if (srvMatch) {
+    var srvText = srvMatch[1].replace(/\\"/g, '"');
+    var reIframeSrc = /src=["']([^"']+)["']/gi;
+    while ((m = reIframeSrc.exec(srvText)) !== null) {
+      add(rawMirror(m[1]));
+    }
+  }
+
+  // 3. Plain <iframe src="...">
   var reIf = /<iframe[^>]+src=["']([^"']+)["']/gi;
   while ((m = reIf.exec(text)) !== null) {
     add(rawMirror(m[1]));
   }
 
+  // 4. All bare URLs anywhere in the page
   var urls = [];
   collectUrls(text, urls);
 
+  // 5. Base64-encoded URLs
   var reB64 = /["']([A-Za-z0-9+\/]{24,}={0,2})["']/g;
   while ((m = reB64.exec(text)) !== null) {
     var dec = b64decode(m[1]);
@@ -283,7 +296,6 @@ function extractStreamsFromPlayer(playerHtml) {
   var seen = {};
   var unpacked = unpackEval(playerHtml);
   var search = cleanEscapes(unpacked || playerHtml);
-  console.log("[QFilm] unpacked:", unpacked ? "yes (" + search.length + " chars)" : "no");
 
   var re = /https?:\/\/[^"'\s<>\\]+\.(?:m3u8|mp4)[^"'\s<>\\]*/gi;
   var m;
@@ -303,7 +315,7 @@ function extractStreamsFromPlayer(playerHtml) {
     streams.push(u2);
   }
 
-  console.log("[QFilm] m3u8/mp4 found:", streams.length);
+  console.log("[QFilm] player yielded", streams.length, "stream(s)");
   return streams;
 }
 
@@ -319,26 +331,23 @@ function qualityFromUrl(url) {
 }
 
 function qualityRankValue(q) {
-  if (q === "4K") return 5;
-  if (q === "1440p") return 4;
-  if (q === "1080p") return 3;
-  if (q === "720p") return 2;
-  if (q === "Auto") return 3;
-  if (q === "480p") return 1;
+  if (q === "4K") return 6;
+  if (q === "1440p") return 5;
+  if (q === "1080p") return 4;
+  if (q === "720p") return 3;
+  if (q === "Auto") return 4;
+  if (q === "480p") return 2;
+  if (q === "360p") return 1;
   return 0;
 }
 
 function makeStream(url, label, playerUrl) {
   var origin = originOf(playerUrl);
   var streamReferer = origin + "/";
-
-  if (url.indexOf("http://") === 0) {
-    url = "https://" + url.slice(7);
-  }
-
+  if (url.indexOf("http://") === 0) url = "https://" + url.slice(7);
   return {
     name: "🎬 QFilm",
-    title: label ? "🎬 QFilm \u2022 " + label : "🎬 QFilm",
+    title: "🎬 QFilm \u2022 " + label,
     url: url,
     quality: qualityFromUrl(url),
     referer: streamReferer,
@@ -354,73 +363,85 @@ function makeStream(url, label, playerUrl) {
 function resolveMirror(mir, referer) {
   return fetchText(mir.embed, referer).then(function(html) {
     var urls = extractStreamsFromPlayer(html);
-    console.log("[QFilm]", mir.label, "streams:", urls.length);
-    if (!urls.length) {
-      return { mirror: mir, streams: [] };
-    }
-    urls.sort(function(a, b) {
-      return qualityRankValue(qualityFromUrl(b)) - qualityRankValue(qualityFromUrl(a));
-    });
-    return { mirror: mir, streams: [makeStream(urls[0], mir.label, mir.embed)] };
+    return { mirror: mir, urls: urls };
   }).catch(function(err) {
     console.log("[QFilm]", mir.label, "failed:", err.message);
-    return { mirror: mir, streams: [] };
+    return { mirror: mir, urls: [] };
   });
 }
 
 function resolveVid(vid) {
-  var embedUrl = buildEmbedUrl(vid);
-  console.log("[QFilm] embed:", embedUrl);
+  var playUrl = BASE + "/play.php?vid=" + vid;
+  var embedUrl = BASE + "/embed.php?vid=" + vid;
+  console.log("[QFilm] play:", playUrl, "embed:", embedUrl);
 
-  return fetchText(embedUrl, BASE + "/").then(function(html) {
-    var mirrors = harvestMirrors(html);
+  return Promise.all([
+    fetchText(playUrl, BASE + "/").catch(function() { return ""; }),
+    fetchText(embedUrl, BASE + "/").catch(function() { return ""; })
+  ]).then(function(htmls) {
+    var mirrors = [];
+    var seen = {};
+    htmls.forEach(function(h) {
+      harvestMirrors(h).forEach(function(mir) {
+        var k = mir.embed.toLowerCase();
+        if (seen[k]) return;
+        seen[k] = 1;
+        mirrors.push(mir);
+      });
+    });
     console.log("[QFilm] mirrors found:", mirrors.length, "->", mirrors.map(function(x) { return x.label; }).join(", "));
     if (!mirrors.length) return [];
 
-    mirrors = mirrors.slice(0, MAX_SERVERS);
+    mirrors = mirrors.slice(0, MAX_PROVIDERS);
 
     return Promise.all(mirrors.map(function(mir) {
-      return withTimeout(resolveMirror(mir, embedUrl), MIRROR_TIMEOUT, { mirror: mir, streams: [] });
+      return withTimeout(resolveMirror(mir, embedUrl), MIRROR_TIMEOUT, { mirror: mir, urls: [] });
     })).then(function(results) {
-      var streams = [];
-      var seenHosts = {};
-      results.forEach(function(r) {
-        if (!r.streams.length) return;
-        var host = r.mirror.host;
-        if (seenHosts[host]) return;
-        seenHosts[host] = 1;
-        streams.push(r.streams[0]);
-      });
-      streams = streams.slice(0, MAX_SERVERS);
-      console.log("[QFilm] unique sources:", streams.length);
-      if (streams.length) return streams;
-
-      console.log("[QFilm] No direct URL — returning embed fallback");
-      var fallbacks = [];
-      var seenHosts2 = {};
+      var byHost = {};
+      var hostOrder = [];
       results.forEach(function(r) {
         var host = r.mirror.host;
-        if (seenHosts2[host]) return;
-        seenHosts2[host] = 1;
-        fallbacks.push({
-          name: "🎬 QFilm",
-          title: "🎬 QFilm (Embed) \u2022 " + r.mirror.label,
-          url: r.mirror.embed,
-          quality: "Auto",
-          type: "iframe",
-          referer: embedUrl
+        if (!byHost[host]) {
+          byHost[host] = { label: r.mirror.label, embed: r.mirror.embed, urls: [] };
+          hostOrder.push(host);
+        }
+        r.urls.forEach(function(u) {
+          if (byHost[host].urls.indexOf(u) === -1) byHost[host].urls.push(u);
         });
       });
-      return fallbacks.slice(0, MAX_SERVERS);
+
+      var streams = [];
+      var fallbacks = [];
+      hostOrder.forEach(function(host) {
+        var g = byHost[host];
+        if (g.urls.length) {
+          g.urls.sort(function(a, b) {
+            return qualityRankValue(qualityFromUrl(b)) - qualityRankValue(qualityFromUrl(a));
+          });
+          streams.push(makeStream(g.urls[0], g.label, g.embed));
+        } else {
+          fallbacks.push({
+            name: "🎬 QFilm",
+            title: "🎬 QFilm (Embed) \u2022 " + g.label,
+            url: g.embed,
+            quality: "Auto",
+            type: "iframe",
+            referer: embedUrl
+          });
+        }
+      });
+
+      console.log("[QFilm] providers resolved:", streams.length, "direct,", fallbacks.length, "embed fallback");
+      return streams.length ? streams : fallbacks;
     });
   }).catch(function(err) {
-    console.log("[QFilm] embed.php failed:", err.message);
+    console.log("[QFilm] resolveVid error:", err.message);
     return [];
   });
 }
 
 function getMovieStreams(tmdbId) {
-  return getTmdbTitles(tmdbId, "movie").then(function(meta) {
+  return getTmdbTitles(tmdbId).then(function(meta) {
     return Promise.all(meta.titles.map(function(t) {
       return searchQFilm(t).catch(function() { return []; });
     })).then(function(groups) {
@@ -443,14 +464,12 @@ function getMovieStreams(tmdbId) {
   });
 }
 
-function getStreams(tmdbId, mediaType, season, episode) {
-  console.log("[QFilm] getStreams:", tmdbId, mediaType, season, episode);
-
+function getStreams(tmdbId, mediaType) {
+  console.log("[QFilm] getStreams:", tmdbId, mediaType);
   if (mediaType === "tv" || mediaType === "series") {
     console.log("[QFilm] Skipping — QFilm is strictly movies only");
     return Promise.resolve([]);
   }
-
   return getMovieStreams(tmdbId);
 }
 
