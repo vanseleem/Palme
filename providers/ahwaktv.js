@@ -69,7 +69,7 @@ function normalizedSet(words) {
 function cleanQuery(text) {
   return decodeEntities(text)
     .replace(/[\u060C\u061B\u061F\u066A-\u066D\u06D4]/g, ' ')
-    .replace(/[!-\/:-@\[-`{-~]/g, ' ')
+    .replace(/[!-\/:-@\[-`{-\~]/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
 }
@@ -173,78 +173,78 @@ function parseTitle(raw) {
     return true;
   });
 
-  if (info.kind === 'series' || info.kind === 'show') {
-    var epIdx = -1;
-    for (var e = 0; e < tokens.length; e++) {
-      if (EPISODE_WORDS[tokens[e]]) { epIdx = e; break; }
-    }
+  // ===== EPISODE =====
+  var epIdx = -1;
+  for (var e = 0; e < tokens.length; e++) {
+    if (EPISODE_WORDS[tokens[e]]) { epIdx = e; break; }
+  }
 
-    if (epIdx !== -1) {
-      var afterEp = tokens[epIdx + 1];
-      if (afterEp && /^\d+$/.test(afterEp)) {
-        info.episode = parseInt(afterEp, 10);
-        tokens.splice(epIdx, 2);
+  if (epIdx !== -1) {
+    var afterEp = tokens[epIdx + 1];
+    if (afterEp && /^\d+$/.test(afterEp)) {
+      info.episode = parseInt(afterEp, 10);
+      tokens.splice(epIdx, 2);
 
-        var ci = epIdx;
-        while (ci < tokens.length) {
-          var ord = readOrdinal(tokens, ci);
-          if (ord && ord.value === info.episode) {
-            tokens.splice(ci, ord.len);
-            continue;
-          }
-          if (tokens[ci] === 'والاخيره' || tokens[ci] === 'الاخيره') {
-            tokens.splice(ci, 1);
-            continue;
-          }
-          if (tokens[ci] === 'و' && tokens[ci + 1] === 'الاخيره') {
-            tokens.splice(ci, 2);
-            continue;
-          }
-          break;
+      var ci = epIdx;
+      while (ci < tokens.length) {
+        var ord = readOrdinal(tokens, ci);
+        if (ord && ord.value === info.episode) {
+          tokens.splice(ci, ord.len);
+          continue;
         }
-      } else {
-        var epOrd = readOrdinal(tokens, epIdx + 1);
-        if (epOrd) {
-          info.episode = epOrd.value;
-          tokens.splice(epIdx, 1 + epOrd.len);
+        if (tokens[ci] === 'والاخيره' || tokens[ci] === 'الاخيره' ||
+            tokens[ci] === 'والأخيرة' || tokens[ci] === 'الأخيرة') {
+          tokens.splice(ci, 1);
+          continue;
         }
+        if (tokens[ci] === 'و' && tokens[ci + 1] === 'الاخيره') {
+          tokens.splice(ci, 2);
+          continue;
+        }
+        break;
+      }
+    } else {
+      var epOrd = readOrdinal(tokens, epIdx + 1);
+      if (epOrd) {
+        info.episode = epOrd.value;
+        tokens.splice(epIdx, 1 + epOrd.len);
       }
     }
+  }
 
-    for (var i = 0; i < tokens.length; i++) {
-      if (SEASON_WORDS[tokens[i]]) {
-        var sOrd = readOrdinal(tokens, i + 1);
-        if (sOrd) {
-          info.season = sOrd.value;
-          tokens.splice(i, 1 + sOrd.len);
-          break;
-        }
-        if (/^\d{1,2}$/.test(tokens[i + 1])) {
-          info.season = parseInt(tokens[i + 1], 10);
-          tokens.splice(i, 2);
-          break;
-        }
+  // ===== SEASON =====
+  for (var i = 0; i < tokens.length; i++) {
+    if (SEASON_WORDS[tokens[i]]) {
+      var sOrd = readOrdinal(tokens, i + 1);
+      if (sOrd) {
+        info.season = sOrd.value;
+        tokens.splice(i, 1 + sOrd.len);
+        break;
+      }
+      if (/^\d{1,2}$/.test(tokens[i + 1])) {
+        info.season = parseInt(tokens[i + 1], 10);
+        tokens.splice(i, 2);
+        break;
       }
     }
+  }
 
-    if (info.season === null) {
-      for (var si = 0; si < tokens.length; si++) {
-        if (/^\d{1,2}$/.test(tokens[si]) && si > 0 && si < tokens.length - 1) {
-          info.season = parseInt(tokens[si], 10);
+  // Bare season number (critical fix for Arabic titles like "طاش ما طاش 13", "الكبير أوي 3", "شباب البومب 9")
+  if (info.season === null && (info.kind === 'series' || info.kind === 'show')) {
+    for (var si = tokens.length - 1; si >= 0; si--) {
+      if (/^\d{1,2}$/.test(tokens[si])) {
+        var num = parseInt(tokens[si], 10);
+        if (num >= 1 && num <= 30 && tokens.length > 1) {
+          info.season = num;
           tokens.splice(si, 1);
           break;
         }
       }
     }
+  }
 
-    if (info.season === null && tokens.length > 1) {
-      var last = tokens[tokens.length - 1];
-      if (/^\d{1,2}$/.test(last)) {
-        info.season = parseInt(last, 10);
-        tokens.pop();
-      }
-    }
-  } else {
+  // year for movies
+  if (info.kind !== 'series' && info.kind !== 'show') {
     for (var j = tokens.length - 1; j >= 0; j--) {
       if (/^(19|20)\d\d$/.test(tokens[j])) {
         if (tokens.length > 1) { info.year = parseInt(tokens[j], 10); tokens.splice(j, 1); }
@@ -624,8 +624,9 @@ function findSeriesEntries(meta, season, episode) {
       var match = strictTitleMatch(info.name, meta.targets);
       if (!match.matched) return;
 
-      var effectiveSeason = info.season === null ? 1 : info.season;
-      if (effectiveSeason !== season) return;
+      // FIXED: do not force season = 1
+      var effectiveSeason = info.season;
+      if (effectiveSeason !== null && effectiveSeason !== season) return;
 
       seen[entry.vid] = true;
       matched.push({
@@ -798,7 +799,7 @@ function fetchEmbedUrls(vid) {
 }
 
 function serverLabel(host) {
-  if (/(^|\.)vk\.com$|vkvideo\.ru$/.test(host)) return 'VK';
+  if (/(^|\.)vk\.com\( |vkvideo\.ru \)/.test(host)) return 'VK';
   if (/(^|\.)ok\.ru$/.test(host)) return 'OK.ru';
   if (/uqload/.test(host)) return 'Uqload';
   if (/vidmoly/.test(host)) return 'Vidmoly';
@@ -941,7 +942,7 @@ function extractOk(embedUrl) {
 function resolveEmbed(embedUrl) {
   var host = hostOf(embedUrl);
   var job;
-  if (/(^|\.)vk\.com$|(^|\.)vkvideo\.ru$/.test(host)) job = extractVk(embedUrl);
+  if (/(^|\.)vk\.com\( |(^|\.)vkvideo\.ru \)/.test(host)) job = extractVk(embedUrl);
   else if (/(^|\.)ok\.ru$/.test(host)) job = extractOk(embedUrl);
   else job = extractGeneric(embedUrl);
   return job.then(function (items) {
@@ -1040,7 +1041,7 @@ function getStreams(tmdbId, mediaType, seasonNum, episodeNum) {
 module.exports = {
   id: PROVIDER_ID,
   name: PROVIDER_NAME,
-  version: '1.0.0',
+  version: '1.1.0',
   supportedTypes: ['movie', 'tv'],
   formats: ['m3u8', 'mp4'],
   getStreams: getStreams,
