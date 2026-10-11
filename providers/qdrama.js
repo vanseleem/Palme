@@ -1,6 +1,7 @@
 var BASE = "https://vod.q-drama.com";
 var UA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Mobile Safari/537.36";
 var TMDB_API_KEY = "83d364331c40bfbe29858aeed82f45cc";
+var MAX_SERVERS = 12;
 var MIRROR_TIMEOUT = 15000;
 var BAD_HOST = /(^|\.)(q-drama\.com|facebook\.com|twitter\.com|google\.com|googleapis\.com|gstatic\.com|w3\.org|schema\.org|cloudflare\.com|jquery\.com|jsdelivr\.net|t\.me|telegram\.org|themoviedb\.org)$/i;
 
@@ -10,29 +11,14 @@ function fetchText(url, referer) {
   });
   var headers = {
     "User-Agent": UA,
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "ar,en-US;q=0.7,en;q=0.3"
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
   };
   if (referer) headers["Referer"] = String(referer).replace(/[^\x00-\x7F]/g, function(c) {
     return encodeURIComponent(c);
   });
-  console.log("[QDrama] → " + url + (referer ? " | ref=" + referer : ""));
   return fetch(url, { headers: headers, redirect: "follow" }).then(function(r) {
-    console.log("[QDrama] ← " + r.status + " " + (r.url || url));
     if (!r.ok) throw new Error("HTTP " + r.status);
-    return r.text().then(function(t) {
-      console.log("[QDrama] ← len=" + t.length);
-      // Cloudflare / bot-wall detection — bail loudly instead of silently
-      if (t.length < 20000 && /cf-chl|challenge-platform|cf_chl_opt|Just a moment|Attention Required|DDoS protection/i.test(t)) {
-        console.log("[QDrama] ⚠ CLOUDFLARE CHALLENGE — real HTML not returned");
-        throw new Error("Cloudflare challenge");
-      }
-      // Empty / truncated shell
-      if (t.length < 300) {
-        console.log("[QDrama] ⚠ suspiciously short body: " + t.slice(0, 200).replace(/\s+/g, " "));
-      }
-      return t;
-    });
+    return r.text();
   });
 }
 
@@ -150,9 +136,7 @@ function getTmdbTitles(tmdbId, mediaType) {
           var dateStr = type === "movie" ? data.release_date : data.first_air_date;
           if (dateStr) year = dateStr.slice(0, 4);
         }
-      }).catch(function(e) {
-        console.log("[QDrama] TMDB fetch failed (" + lang + "):", e && e.message);
-      });
+      }).catch(function() {});
     });
   }, Promise.resolve()).then(function() {
     if (!titles.length) throw new Error("Could not get TMDB titles for " + tmdbId);
@@ -163,7 +147,7 @@ function getTmdbTitles(tmdbId, mediaType) {
 
 function searchQDrama(title) {
   var cleanTitle = String(title || "").replace(/[:\u060C-\u061F]/g, " ").replace(/\s+/g, " ").trim();
-  var url = BASE + "/search.php?keywords=" + encodeURIComponent(cleanTitle) + "&video-id=";
+  var url = BASE + "/search.php?keywords=" + encodeURIComponent(cleanTitle);
   console.log("[QDrama] Search:", cleanTitle);
   return fetchText(url, BASE + "/").then(function(html) {
     var results = [];
@@ -209,8 +193,6 @@ function chooseResult(results, titles, year, isTv) {
 function buildEmbedUrl(vid) {
   return BASE + "/embed.php?vid=" + vid;
 }
-
-/* ---------- mirror discovery ---------- */
 
 function hostLabel(host) {
   var parts = String(host).replace(/^www\./, "").split(".");
@@ -281,7 +263,11 @@ function harvestMirrors(html) {
   var text = cleanEscapes(html);
   var m;
 
-  // QDrama-specific: <option value="URL"> in the server dropdown
+  var reData = /data-embed-\s*url\s*=\s*["']([^"']+)["']/gi;
+  while ((m = reData.exec(text)) !== null) {
+    add(rawMirror(m[1]) || normalizeMirror(m[1]));
+  }
+
   var reOpt = /<option[^>]+value=["']([^"']+)["'][^>]*>/gi;
   while ((m = reOpt.exec(text)) !== null) {
     if (m[1].indexOf("http") !== 0) continue;
@@ -303,15 +289,8 @@ function harvestMirrors(html) {
   }
 
   urls.forEach(function(u) { add(normalizeMirror(u)); });
-
-  console.log("[QDrama] harvest: options=" + (text.match(/<option/gi) || []).length +
-              " iframes=" + (text.match(/<iframe/gi) || []).length +
-              " urls=" + urls.length +
-              " mirrors=" + out.length);
   return out;
 }
-
-/* ---------- player extraction ---------- */
 
 function packerEncode(c, a) {
   return (c < a ? "" : packerEncode(parseInt(c / a, 10), a)) +
@@ -365,14 +344,6 @@ function extractStreamsFromPlayer(playerHtml) {
   }
 
   console.log("[QDrama] m3u8/mp4 found:", streams.length);
-  if (!streams.length) {
-    var packed = /eval\(function\(p,a,c,k,e,/i.test(playerHtml);
-    var hasM3u8Ref = /\.m3u8/i.test(playerHtml);
-    var hasMp4Ref  = /\.mp4/i.test(playerHtml);
-    console.log("[QDrama] extract: 0 streams | packed=" + packed +
-                " m3u8ref=" + hasM3u8Ref + " mp4ref=" + hasMp4Ref +
-                " bodyLen=" + playerHtml.length);
-  }
   return streams;
 }
 
@@ -384,7 +355,17 @@ function qualityFromUrl(url) {
   if (/720/.test(s)) return "720p";
   if (/480/.test(s)) return "480p";
   if (/360/.test(s)) return "360p";
-  return "Unknown";
+  return "Auto";
+}
+
+function qualityRankValue(q) {
+  if (q === "4K") return 5;
+  if (q === "1440p") return 4;
+  if (q === "1080p") return 3;
+  if (q === "720p") return 2;
+  if (q === "Auto") return 3;
+  if (q === "480p") return 1;
+  return 0;
 }
 
 function makeStream(url, label, playerUrl) {
@@ -414,10 +395,13 @@ function resolveMirror(mir, referer) {
   return fetchText(mir.embed, referer).then(function(html) {
     var urls = extractStreamsFromPlayer(html);
     console.log("[QDrama]", mir.label, "streams:", urls.length);
-    var streams = urls.map(function(u, i) {
-      return makeStream(u, mir.label + (urls.length > 1 ? " #" + (i + 1) : ""), mir.embed);
+    if (!urls.length) {
+      return { mirror: mir, streams: [] };
+    }
+    urls.sort(function(a, b) {
+      return qualityRankValue(qualityFromUrl(b)) - qualityRankValue(qualityFromUrl(a));
     });
-    return { mirror: mir, streams: streams };
+    return { mirror: mir, streams: [makeStream(urls[0], mir.label, mir.embed)] };
   }).catch(function(err) {
     console.log("[QDrama]", mir.label, "failed:", err.message);
     return { mirror: mir, streams: [] };
@@ -428,7 +412,8 @@ function resolveVid(vid) {
   var embedUrl = buildEmbedUrl(vid);
   var pages = [
     embedUrl,
-    BASE + "/watch.php?vid=" + vid
+    BASE + "/watch.php?vid=" + vid,
+    BASE + "/play.php?vid=" + vid
   ];
   console.log("[QDrama] embed:", embedUrl);
 
@@ -454,27 +439,36 @@ function resolveVid(vid) {
     return Promise.all(mirrors.map(function(mir) {
       return withTimeout(resolveMirror(mir, embedUrl), MIRROR_TIMEOUT, { mirror: mir, streams: [] });
     })).then(function(results) {
-      var out = [];
-      var seenUrl = {};
+      var streams = [];
+      var seenHosts = {};
       results.forEach(function(r) {
-        r.streams.forEach(function(s) {
-          if (seenUrl[s.url]) return;
-          seenUrl[s.url] = 1;
-          out.push(s);
-        });
+        if (!r.streams.length) return;
+        var host = r.mirror.host;
+        if (seenHosts[host]) return;
+        seenHosts[host] = 1;
+        streams.push(r.streams[0]);
       });
-      if (out.length) return out;
+      streams = streams.slice(0, MAX_SERVERS);
+      console.log("[QDrama] unique sources:", streams.length);
+      if (streams.length) return streams;
+
       console.log("[QDrama] No direct URL — returning embed fallback");
-      return results.slice(0, 3).map(function(r) {
-        return {
+      var fallbacks = [];
+      var seenHosts2 = {};
+      results.forEach(function(r) {
+        var host = r.mirror.host;
+        if (seenHosts2[host]) return;
+        seenHosts2[host] = 1;
+        fallbacks.push({
           name: "🎖️ QDrama",
           title: "🎖️ QDrama (Embed) \u2022 " + r.mirror.label,
           url: r.mirror.embed,
           quality: "Auto",
           type: "iframe",
           referer: embedUrl
-        };
+        });
       });
+      return fallbacks.slice(0, MAX_SERVERS);
     });
   });
 }
