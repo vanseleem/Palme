@@ -1,6 +1,7 @@
 var BASE = "https://akwam.ss";
 var UA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Mobile Safari/537.36";
 var TMDB_API_KEY = "83d364331c40bfbe29858aeed82f45cc";
+var MAX_SERVERS = 10;
 
 function fetchText(url, referer) {
   url = String(url).replace(/[^\x00-\x7F]/g, function(c) {
@@ -55,49 +56,6 @@ function similarity(a, b) {
   var common = 0;
   aa.forEach(function(x) { if (bb.has(x)) common++; });
   return common / Math.max(aa.size, bb.size);
-}
-
-function qualityRank(q) {
-  var s = String(q || "").toLowerCase();
-  if (/2160|4k/.test(s)) return 6;
-  if (/1440/.test(s)) return 5;
-  if (/1080/.test(s)) return 4;
-  if (/720/.test(s)) return 3;
-  if (/auto/.test(s)) return 3;
-  if (/480/.test(s)) return 2;
-  if (/360/.test(s)) return 1;
-  if (/240/.test(s)) return 0;
-  return 0;
-}
-
-function groupSourcesByProvider(sources) {
-  var byHost = {};
-  var order = [];
-  sources.forEach(function(s) {
-    var m = String(s.url).match(/^https?:\/\/([^\/?#:]+)/i);
-    var host = m ? m[1].toLowerCase().replace(/^www\./, "") : "unknown";
-    if (!byHost[host]) {
-      byHost[host] = [];
-      order.push(host);
-    }
-    byHost[host].push(s);
-  });
-  var out = [];
-  order.forEach(function(host) {
-    var group = byHost[host];
-    group.sort(function(a, b) {
-      return qualityRank(b.quality) - qualityRank(a.quality);
-    });
-    var best = group[0];
-    var showQ = best.quality && best.quality !== "Unknown" && best.quality !== "Auto";
-    out.push({
-      name: "Akwam",
-      title: "Akwam • " + host + (showQ ? " " + best.quality : ""),
-      url: best.url,
-      quality: best.quality
-    });
-  });
-  return out;
 }
 
 function getSearchTitle(tmdbId, mediaType) {
@@ -223,7 +181,7 @@ function extractWatchUrls(html) {
     var absolute = url.startsWith("http") ? url : BASE + url;
     if (!seen.has(absolute)) { seen.add(absolute); urls.push(absolute); }
   }
-  return urls;
+  return urls.slice(0, MAX_SERVERS);
 }
 
 function extractSources(html) {
@@ -243,9 +201,70 @@ function extractSources(html) {
     seen.add(url);
     var qualityMatch = source.match(/\bsize=["']([^"']+)["']/i) || source.match(/\blabel=["']([^"']+)["']/i);
     var quality = qualityMatch ? qualityMatch[1] : "Unknown";
-    streams.push({ url: url, quality: quality });
+    streams.push({
+      name: "Akwam",
+      title: quality === "Unknown" ? "Akwam" : "Akwam " + quality,
+      url: url,
+      quality: quality
+    });
   }
   return streams;
+}
+
+var QUALITY_TIERS = [
+  { rank: 7, label: "2160p", re: /4k|uhd|2160/i },
+  { rank: 6, label: "1440p", re: /1440|qhd/i },
+  { rank: 5, label: "1080p", re: /1080|fhd/i },
+  { rank: 4, label: "720p",  re: /720|\bhd\b/i },
+  { rank: 4, label: "Auto",  re: /auto/i },
+  { rank: 3, label: "480p",  re: /480/i },
+  { rank: 2, label: "360p",  re: /360/i },
+  { rank: 1, label: "240p",  re: /240/i }
+];
+
+function qualityTier(quality) {
+  var q = String(quality || "");
+  for (var i = 0; i < QUALITY_TIERS.length; i++) {
+    if (QUALITY_TIERS[i].re.test(q)) return QUALITY_TIERS[i];
+  }
+  return { rank: 0, label: null };
+}
+
+function qualityRank(quality) {
+  return qualityTier(quality).rank;
+}
+
+function hostOf(url) {
+  var m = String(url || "").match(/^(?:https?:)?\/\/([^\/?#:]+)/i);
+  return m ? m[1].toLowerCase() : String(url || "");
+}
+
+function groupSourcesByProvider(sources) {
+  var groups = {};
+  var hosts = [];
+
+  (sources || []).forEach(function(source) {
+    var host = hostOf(source.url);
+    if (!groups[host]) {
+      groups[host] = [];
+      hosts.push(host);
+    }
+    groups[host].push(source);
+  });
+
+  return hosts.map(function(host) {
+    var best = groups[host].slice().sort(function(a, b) {
+      return qualityRank(b.quality) - qualityRank(a.quality);
+    })[0];
+
+    var tier = qualityTier(best.quality);
+    return {
+      name: "Akwam",
+      title: tier.label ? "Akwam " + tier.label : "Akwam",
+      url: best.url,
+      quality: tier.label || "Unknown"
+    };
+  });
 }
 
 function flattenOnce(groups) {
@@ -283,7 +302,7 @@ function getMovieStreams(tmdbId) {
             return extractSources(watchHtml);
           }).catch(function() { return []; });
         }));
-      }).then(flattenOnce).then(groupSourcesByProvider);
+      }).then(flattenOnce);
     });
   }).catch(function(err) {
     console.error("[Akwam] Movie error:", err.message);
@@ -403,7 +422,7 @@ function getTvStreams(tmdbId, season, episode) {
             console.error("[Akwam] Episode page failed:", err.message);
             return [];
           });
-        })).then(flattenOnce).then(groupSourcesByProvider);
+        })).then(flattenOnce);
       });
     });
   }).catch(function(err) {
@@ -414,10 +433,16 @@ function getTvStreams(tmdbId, season, episode) {
 
 function getStreams(tmdbId, mediaType, season, episode) {
   console.log("[Akwam] getStreams:", tmdbId, mediaType, season, episode);
-  if (mediaType === "tv") {
-    return getTvStreams(tmdbId, season, episode);
-  }
-  return getMovieStreams(tmdbId);
+
+  var request = mediaType === "tv"
+    ? getTvStreams(tmdbId, season, episode)
+    : getMovieStreams(tmdbId);
+
+  return request.then(function(sources) {
+    var grouped = groupSourcesByProvider(sources);
+    console.log("[Akwam] Sources:", sources.length, "-> per host:", grouped.length);
+    return grouped;
+  });
 }
 
 module.exports = {
