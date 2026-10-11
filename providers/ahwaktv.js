@@ -52,6 +52,7 @@ function normalizeText(input) {
     .replace(/\u0629/g, '\u0647')
     .replace(/\u0624/g, '\u0648')
     .replace(/\u0626/g, '\u064A')
+    .replace(/\u0638/g, '\u0636')
     .replace(/\u0686/g, '\u062C')
     .replace(/\u067E/g, '\u0628')
     .replace(/\u06A4/g, '\u0641')
@@ -90,7 +91,7 @@ var KIND_BY_WORD = {};
 
 var DUB_WORDS = normalizedSet(['مدبلج', 'مدبلجة', 'dubbed', 'dub']);
 var SUB_WORDS = normalizedSet(['مترجم', 'مترجمة', 'subtitled', 'subbed', 'sub']);
-var SEASON_WORDS = normalizedSet(['الموسم', 'الجزء', 'season']);
+var SEASON_WORDS = normalizedSet(['الموسم', 'موسم', 'الجزء', 'جزء', 'season']);
 var EPISODE_WORDS = normalizedSet(['الحلقة', 'episode', 'ep']);
 var NOISE_WORDS = normalizedSet([
   'كامل', 'كاملة', 'hd', 'fhd', 'uhd', '4k', 'bluray', 'hdrip', 'webrip', '720p', '1080p',
@@ -155,7 +156,7 @@ function stripParentheses(text) {
 
 function parseTitle(raw) {
   var info = { kind: null, name: '', year: null, season: null, episode: null, dubbed: false, subbed: false };
-  var cleaned = stripParentheses(raw);
+  var cleaned = stripParentheses(String(raw || '').split('|')[0]);
   var tokens = normalizeText(cleaned).split(' ').filter(Boolean);
 
   var kindIdx = -1;
@@ -173,78 +174,67 @@ function parseTitle(raw) {
     return true;
   });
 
-  // ===== EPISODE =====
-  var epIdx = -1;
-  for (var e = 0; e < tokens.length; e++) {
-    if (EPISODE_WORDS[tokens[e]]) { epIdx = e; break; }
-  }
-
-  if (epIdx !== -1) {
-    var afterEp = tokens[epIdx + 1];
-    if (afterEp && /^\d+$/.test(afterEp)) {
-      info.episode = parseInt(afterEp, 10);
-      tokens.splice(epIdx, 2);
-
-      var ci = epIdx;
-      while (ci < tokens.length) {
-        var ord = readOrdinal(tokens, ci);
-        if (ord && ord.value === info.episode) {
-          tokens.splice(ci, ord.len);
-          continue;
-        }
-        if (tokens[ci] === 'والاخيره' || tokens[ci] === 'الاخيره' ||
-            tokens[ci] === 'والأخيرة' || tokens[ci] === 'الأخيرة') {
-          tokens.splice(ci, 1);
-          continue;
-        }
-        if (tokens[ci] === 'و' && tokens[ci + 1] === 'الاخيره') {
-          tokens.splice(ci, 2);
-          continue;
-        }
-        break;
-      }
-    } else {
-      var epOrd = readOrdinal(tokens, epIdx + 1);
-      if (epOrd) {
-        info.episode = epOrd.value;
-        tokens.splice(epIdx, 1 + epOrd.len);
-      }
+  var episodic = info.kind === 'series' || info.kind === 'show';
+  if (!episodic && info.kind !== 'movie' && info.kind !== 'play') {
+    for (var ei = 0; ei < tokens.length; ei++) {
+      if (EPISODE_WORDS[tokens[ei]] || SEASON_WORDS[tokens[ei]]) { episodic = true; break; }
     }
   }
 
-  // ===== SEASON =====
-  for (var i = 0; i < tokens.length; i++) {
-    if (SEASON_WORDS[tokens[i]]) {
-      var sOrd = readOrdinal(tokens, i + 1);
-      if (sOrd) {
-        info.season = sOrd.value;
-        tokens.splice(i, 1 + sOrd.len);
-        break;
-      }
-      if (/^\d{1,2}$/.test(tokens[i + 1])) {
-        info.season = parseInt(tokens[i + 1], 10);
-        tokens.splice(i, 2);
-        break;
+  if (episodic) {
+    var epIdx = -1;
+    for (var e = 0; e < tokens.length; e++) {
+      if (EPISODE_WORDS[tokens[e]]) { epIdx = e; break; }
+    }
+
+    if (epIdx !== -1) {
+      var afterEp = tokens[epIdx + 1];
+      if (afterEp && /^\d+$/.test(afterEp)) {
+        info.episode = parseInt(afterEp, 10);
+        tokens.splice(epIdx, 2);
+
+        var ci = epIdx;
+        while (ci < tokens.length) {
+          var ord = readOrdinal(tokens, ci);
+          if (ord && ord.value === info.episode) {
+            tokens.splice(ci, ord.len);
+            continue;
+          }
+          if (tokens[ci] === 'والاخيره' || tokens[ci] === 'الاخيره') {
+            tokens.splice(ci, 1);
+            continue;
+          }
+          if (tokens[ci] === 'و' && tokens[ci + 1] === 'الاخيره') {
+            tokens.splice(ci, 2);
+            continue;
+          }
+          break;
+        }
+      } else {
+        var epOrd = readOrdinal(tokens, epIdx + 1);
+        if (epOrd) {
+          info.episode = epOrd.value;
+          tokens.splice(epIdx, 1 + epOrd.len);
+        }
       }
     }
-  }
 
-  // Bare season number (critical fix for Arabic titles like "طاش ما طاش 13", "الكبير أوي 3", "شباب البومب 9")
-  if (info.season === null && (info.kind === 'series' || info.kind === 'show')) {
-    for (var si = tokens.length - 1; si >= 0; si--) {
-      if (/^\d{1,2}$/.test(tokens[si])) {
-        var num = parseInt(tokens[si], 10);
-        if (num >= 1 && num <= 30 && tokens.length > 1) {
-          info.season = num;
-          tokens.splice(si, 1);
+    for (var i = 0; i < tokens.length; i++) {
+      if (SEASON_WORDS[tokens[i]]) {
+        var sOrd = readOrdinal(tokens, i + 1);
+        if (sOrd) {
+          info.season = sOrd.value;
+          tokens.splice(i, 1 + sOrd.len);
+          break;
+        }
+        if (/^\d{1,2}$/.test(tokens[i + 1] || '')) {
+          info.season = parseInt(tokens[i + 1], 10);
+          tokens.splice(i, 2);
           break;
         }
       }
     }
-  }
-
-  // year for movies
-  if (info.kind !== 'series' && info.kind !== 'show') {
+  } else {
     for (var j = tokens.length - 1; j >= 0; j--) {
       if (/^(19|20)\d\d$/.test(tokens[j])) {
         if (tokens.length > 1) { info.year = parseInt(tokens[j], 10); tokens.splice(j, 1); }
@@ -330,9 +320,10 @@ function parseWatchAnchors(html) {
     var text = decodeEntities(inner.replace(/<[^>]*>/g, ' ')).replace(/\s+/g, ' ').trim();
     if (byVid[vid]) {
       if (!byVid[vid].title && title) byVid[vid].title = title;
+      if (inner && inner.indexOf('<em') !== -1) byVid[vid].htmlInner = inner;
       continue;
     }
-    byVid[vid] = { vid: vid, title: title, text: text, index: m.index };
+    byVid[vid] = { vid: vid, title: title, text: text, index: m.index, htmlInner: inner };
     out.push(byVid[vid]);
   }
   return out;
@@ -404,6 +395,7 @@ function buildMeta(data, type) {
     displayTitle: titles.length ? titles[0].raw : (isTv ? data.name : data.title),
     englishTitle: englishTitle,
     targets: titles.map(function (t) { return t.norm; }),
+    rawTitles: titles.slice(0, 4).map(function (t) { return t.raw; }),
     queries: titles.slice(0, 3).map(function (t) { return cleanQuery(t.raw); }).filter(Boolean)
   };
 }
@@ -423,6 +415,11 @@ function buildQueries(title, meta, type, season, episode) {
   }
 
   add(title);
+  if (meta.englishTitle && meta.englishTitle !== title) add(meta.englishTitle);
+  if (type === 'tv') {
+    add('مسلسل ' + title);
+    if (meta.englishTitle && meta.englishTitle !== title) add('مسلسل ' + meta.englishTitle);
+  }
 
   if (type === 'tv' && season) {
     var arSeason = arabicOrdinal(season);
@@ -608,168 +605,310 @@ function getMovieStreams(meta, title) {
   });
 }
 
-function findSeriesEntries(meta, season, episode) {
-  var matched = [];
-  var seen = {};
-
-  function onEntries(entries) {
-    var haveExact = false;
-    entries.forEach(function (entry) {
-      if (seen[entry.vid]) return;
-      var info = parseTitle(entry.title);
-      if (info.kind !== 'series' && info.kind !== 'show') return;
-      if (info.episode === null) return;
-      if (meta.arabic && SKIP_DUB_SUB_ARABIC && (info.dubbed || info.subbed)) return;
-
-      var match = strictTitleMatch(info.name, meta.targets);
-      if (!match.matched) return;
-
-      // FIXED: do not force season = 1
-      var effectiveSeason = info.season;
-      if (effectiveSeason !== null && effectiveSeason !== season) return;
-
-      seen[entry.vid] = true;
-      matched.push({
-        vid: entry.vid,
-        title: entry.title,
-        info: info,
-        entrySeason: info.season,
-        partial: !!match.partial
-      });
-      if (info.episode === episode) haveExact = true;
-    });
-    return haveExact;
+function matchFlexible(name, targets) {
+  var tokens = normalizeText(name).split(' ').filter(Boolean);
+  if (!tokens.length) return null;
+  var joined = tokens.join(' ');
+  var t;
+  for (t = 0; t < targets.length; t++) {
+    if (joined === targets[t]) return { season: null, targetIndex: t };
   }
-
-  var queries = buildQueries(meta.displayTitle, meta, 'tv', season, episode);
-  return searchQueries(queries, onEntries, function () {
-    return matched.some(function (m) { return m.info.episode === episode && !m.partial; });
-  }).then(function () { return matched; });
-}
-
-function parseSeasons(html) {
-  var headings = [];
-  var hre = />\s*الموسم\s*([0-9\u0660-\u0669]+)\s*</g;
-  var m;
-  while ((m = hre.exec(html)) !== null) {
-    headings.push({ index: m.index, season: parseInt(toWesternDigits(m[1]), 10) });
-  }
-
-  var anchors = parseWatchAnchors(html);
-  var sections = [];
-  var bySeason = {};
-  anchors.forEach(function (a) {
-    var season = 1;
-    headings.forEach(function (h) { if (h.index < a.index) season = h.season; });
-    var episode = a.title ? parseTitle(a.title).episode : null;
-    if (episode === null) {
-      var n = /\d+/.exec(toWesternDigits(a.text));
-      episode = n ? parseInt(n[0], 10) : null;
+  for (t = 0; t < targets.length; t++) {
+    var tt = String(targets[t] || '').split(' ').filter(Boolean);
+    if (!tt.length || tokens.length < tt.length) continue;
+    var ok = true;
+    for (var j = 0; j < tt.length; j++) {
+      if (tokens[j] !== tt[j]) { ok = false; break; }
     }
-    if (episode === null) return;
-    if (!bySeason[season]) {
-      bySeason[season] = { season: season, episodes: [] };
-      sections.push(bySeason[season]);
+    if (!ok) continue;
+    var rest = tokens.slice(tt.length);
+    var season = null;
+    if (rest.length && /^\d{1,2}$/.test(rest[0])) {
+      var n = parseInt(rest[0], 10);
+      if (n >= 1 && n <= 40) {
+        season = n;
+        rest = rest.slice(1);
+      }
     }
-    bySeason[season].episodes.push({ episode: episode, vid: a.vid });
-  });
-
-  var ambiguous = false;
-  for (var i = 0; i < headings.length - 1; i++) {
-    var between = anchors.filter(function (a) {
-      return a.index > headings[i].index && a.index < headings[i + 1].index;
-    });
-    if (!between.length) ambiguous = true;
-  }
-  return { sections: sections, ambiguous: ambiguous };
-}
-
-function sliceEpisodeBlock(html) {
-  var start = html.indexOf('المواسم والحلقات');
-  if (start === -1) return '';
-  var end = html.length;
-  ['pm-user-header', 'pm-video-posting-info', 'pm-video-description'].forEach(function (marker) {
-    var i = html.indexOf(marker, start);
-    if (i !== -1 && i < end) end = i;
-  });
-  return html.slice(start, end);
-}
-
-function fetchSeriesSections(vid) {
-  var watchUrl = BASE_URL + '/watch.php?vid=' + vid;
-  return siteGet(watchUrl).then(function (html) {
-    var fromWatchPage = function () { return parseSeasons(sliceEpisodeBlock(html)); };
-    var link = /href\s*=\s*["']([^"']*view-serie\.php\?[^"']+)["']/i.exec(html);
-    var serieUrl = link ? absoluteUrl(link[1], BASE_URL) : '';
-    if (!serieUrl) return fromWatchPage();
-    return siteGet(serieUrl, watchUrl).then(function (serieHtml) {
-      var parsed = parseSeasons(serieHtml);
-      return parsed.sections.length ? parsed : fromWatchPage();
-    }, fromWatchPage);
-  });
-}
-
-function pickFromSections(parsed, season, episode, entrySeason) {
-  if (!parsed || parsed.ambiguous) return null;
-  var section = null;
-  parsed.sections.forEach(function (s) { if (s.season === season) section = s; });
-  if (!section && parsed.sections.length === 1) {
-    var es = entrySeason === null ? 1 : entrySeason;
-    if (season === 1 || es === season) section = parsed.sections[0];
-  }
-  if (!section) return null;
-  for (var i = 0; i < section.episodes.length; i++) {
-    if (section.episodes[i].episode === episode) return section.episodes[i];
+    // Extra words with no season number are a different show (Dead City, Your Friends).
+    if (rest.length && season === null) continue;
+    if (rest.length > 5) continue;
+    return { season: season, targetIndex: t };
   }
   return null;
 }
 
-function resolveEpisodeVids(matched, season, episode) {
-  var direct = matched.filter(function (e) {
-    var es = e.entrySeason === null ? 1 : e.entrySeason;
-    return e.info.episode === episode && es === season && !e.partial;
-  });
-  if (direct.length === 1) return Promise.resolve([direct[0].vid]);
+function seasonHintOf(info, mm) {
+  if (info && info.season != null) return info.season;
+  if (mm && mm.season != null) return mm.season;
+  return null;
+}
 
-  var rep = matched[0];
-  matched.forEach(function (e) {
-    var es = e.entrySeason === null ? 1 : e.entrySeason;
-    var rs = rep.entrySeason === null ? 1 : rep.entrySeason;
-    if (rs !== season && es === season) rep = e;
-  });
+var SITE_TITLE_NOISE = normalizedSet([
+  'اهواك', 'تي', 'في', 'مشاهده', 'افلام', 'مسلسلات', 'رمضان', 'جميع', 'المواسم',
+  'الملفات', 'الحلقات', 'اون', 'لاين', 'موقع', 'مشاهدة'
+]);
 
-  return fetchSeriesSections(rep.vid).then(function (parsed) {
-    var hit = pickFromSections(parsed, season, episode, rep.entrySeason);
-    if (hit) return [hit.vid];
-    if (parsed.ambiguous) log('season layout not understood on the series page');
-    return direct.map(function (e) { return e.vid; });
-  }).catch(function (err) {
-    log('series page failed: ' + (err && err.message));
-    return direct.map(function (e) { return e.vid; });
+function cleanHead(text) {
+  var tokens = normalizeText(stripParentheses(String(text || '').split('|')[0])).split(' ').filter(Boolean);
+  if (tokens.length && KIND_BY_WORD[tokens[0]]) tokens.shift();
+  tokens = tokens.filter(function (t) {
+    return !SITE_TITLE_NOISE[t] && !NOISE_WORDS[t] && !DUB_WORDS[t] && !SUB_WORDS[t] && !/^(19|20)\d\d$/.test(t);
+  });
+  return tokens.join(' ');
+}
+
+function headingTexts(html) {
+  var out = [];
+  var tm = /<title>([^<]*)<\/title>/i.exec(html);
+  if (tm) out.push(decodeEntities(tm[1]));
+  var re = /<h1\b[^>]*>([\s\S]*?)<\/h1>/gi;
+  var m;
+  while ((m = re.exec(html)) !== null) {
+    out.push(decodeEntities(m[1].replace(/<[^>]+>/g, ' ')));
+  }
+  return out;
+}
+
+function hubMatches(html, targets) {
+  if (!html) return false;
+  if (/هذا المسلسل غير متوفر/.test(html) && !/id=["']Season\d+["']/.test(html)) return false;
+  var heads = headingTexts(html);
+  for (var i = 0; i < heads.length; i++) {
+    var name = cleanHead(heads[i]);
+    if (name && targets.indexOf(name) !== -1) return true;
+  }
+  return false;
+}
+
+function episodeFromAnchor(a) {
+  var info = parseTitle(a.title || '');
+  var ep = info.episode;
+  if (ep == null && a.htmlInner) {
+    var em = /<em>\s*([0-9]{1,4})\s*<\/em>/i.exec(a.htmlInner);
+    if (em) ep = parseInt(em[1], 10);
+  }
+  if (ep == null && a.text && String(a.text).length < 24) {
+    var n = /\d+/.exec(toWesternDigits(a.text));
+    if (n) ep = parseInt(n[0], 10);
+  }
+  return { info: info, episode: ep };
+}
+
+// Season buttons are printed before every list, so button position is not the season.
+// The id="SeasonN" block is.
+function parseSeasonBlocks(html) {
+  var marks = [];
+  var re = /id=["']Season(\d+)["']/gi;
+  var m;
+  while ((m = re.exec(html)) !== null) marks.push({ season: parseInt(m[1], 10), index: m.index });
+  var blocks = [];
+  for (var i = 0; i < marks.length; i++) {
+    var end = i + 1 < marks.length ? marks[i + 1].index : html.length;
+    var chunk = html.slice(marks[i].index, end);
+    var ulEnd = chunk.search(/<\/ul>/i);
+    if (ulEnd !== -1) chunk = chunk.slice(0, ulEnd);
+    var rel = chunk.search(/id=["']pm-related["']|قد يعجبك|pm-video-watch-sidebar/i);
+    if (rel !== -1) chunk = chunk.slice(0, rel);
+    var anchors = parseWatchAnchors(chunk);
+    var episodes = [];
+    var seenVid = {};
+    var seenEp = {};
+    anchors.forEach(function (a) {
+      if (seenVid[a.vid]) return;
+      seenVid[a.vid] = true;
+      var parsed = episodeFromAnchor(a);
+      if (parsed.episode == null) return;
+      if (seenEp[parsed.episode]) return;
+      seenEp[parsed.episode] = true;
+      episodes.push({ episode: parsed.episode, vid: a.vid, info: parsed.info, title: a.title || '' });
+    });
+    blocks.push({ season: marks[i].season, episodes: episodes });
+  }
+  return blocks;
+}
+
+function pickEpisode(blocks, season, episode, arabic) {
+  var block = null;
+  for (var i = 0; i < blocks.length; i++) {
+    if (blocks[i].season === season) block = blocks[i];
+  }
+  if (!block) return null;
+  var opts = block.episodes.filter(function (e) { return e.episode === episode; });
+  if (arabic && SKIP_DUB_SUB_ARABIC) {
+    var clean = opts.filter(function (e) { return !(e.info && (e.info.dubbed || e.info.subbed)); });
+    if (clean.length) opts = clean;
+    else if (opts.length) return null;
+  }
+  return opts.length ? opts[0].vid : null;
+}
+
+function findFlat(html, targets, season, episode, arabic) {
+  var anchors = parseWatchAnchors(html);
+  var seen = {};
+  var hit = null;
+  anchors.forEach(function (a) {
+    if (hit || seen[a.vid] || !a.title) return;
+    seen[a.vid] = true;
+    var info = parseTitle(a.title);
+    if (info.kind === 'movie' || info.kind === 'play' || info.episode == null) return;
+    if (arabic && SKIP_DUB_SUB_ARABIC && (info.dubbed || info.subbed)) return;
+    var mm = matchFlexible(info.name, targets);
+    if (!mm) return;
+    var hint = seasonHintOf(info, mm);
+    if (hint == null) hint = 1;
+    if (hint === season && info.episode === episode) hit = a.vid;
+  });
+  return hit;
+}
+
+function hubUrls(meta) {
+  var urls = [];
+  var seen = {};
+  function add(url) {
+    if (!url || seen[url]) return;
+    seen[url] = true;
+    urls.push(url);
+  }
+  (meta.rawTitles || []).forEach(function (raw) {
+    var clean = String(raw || '').replace(/\([^)]*\)/g, ' ').replace(/\s+/g, ' ').trim();
+    if (!clean) return;
+    if (hasArabicScript(clean)) {
+      var hyph = clean.replace(/\s+/g, '-');
+      var yeh = hyph.replace(/\u064A/g, '\u0649');
+      add(BASE_URL + '/view-serie.php?name=' + encodeURIComponent(hyph));
+      add(BASE_URL + '/view-serie.php?name=' + encodeURIComponent(yeh));
+      add(BASE_URL + '/view-serie.php?name=' + encodeURIComponent(hyph.replace(/\u0623/g, '\u0627').replace(/\u0625/g, '\u0627')));
+      add(BASE_URL + '/view-serie.php?name=' + encodeURIComponent(clean));
+    } else {
+      var slug = clean.replace(/['’"\.:,!؟?]/g, '').replace(/\s+/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '');
+      var low = slug.toLowerCase();
+      add(BASE_URL + '/view-serie.php?name=' + encodeURIComponent(low));
+      add(BASE_URL + '/view-serie.php?name=' + encodeURIComponent('مسلسل-' + low));
+      add(BASE_URL + '/category.php?cat=' + encodeURIComponent(slug + '-series-full-episodes'));
+    }
+  });
+  return urls.slice(0, 8);
+}
+
+function loadHubs(meta) {
+  return Promise.all(hubUrls(meta).map(function (url) {
+    return siteGet(url).then(function (html) {
+      if (!hubMatches(html, meta.targets)) return null;
+      return { url: url, html: html, blocks: parseSeasonBlocks(html) };
+    }).catch(function () { return null; });
+  })).then(function (list) { return list.filter(Boolean); });
+}
+
+function findSeriesMatches(meta, season, episode) {
+  var matched = [];
+  var seen = {};
+
+  function onEntries(entries) {
+    var haveExplicit = false;
+    entries.forEach(function (entry) {
+      if (seen[entry.vid]) return;
+      var info = parseTitle(entry.title || '');
+      if (info.kind === 'movie' || info.kind === 'play' || info.episode == null) return;
+      if (meta.arabic && SKIP_DUB_SUB_ARABIC && (info.dubbed || info.subbed)) return;
+      var mm = matchFlexible(info.name, meta.targets);
+      if (!mm) return;
+      seen[entry.vid] = true;
+      var hint = seasonHintOf(info, mm);
+      matched.push({ vid: entry.vid, title: entry.title, info: info, seasonHint: hint });
+      if (info.episode === episode && hint === season) haveExplicit = true;
+    });
+    return haveExplicit;
+  }
+
+  var queries = buildQueries(meta.displayTitle, meta, 'tv', season, episode);
+  return searchQueries(queries, onEntries, function () {
+    return matched.some(function (m) { return m.info.episode === episode && m.seasonHint === season; });
+  }).then(function () { return matched; });
+}
+
+function serieUrlFromWatch(html) {
+  var m = /href\s*=\s*["']([^"']*view-serie\.php\?[^"']+)["']/i.exec(html || '');
+  return m ? absoluteUrl(m[1], BASE_URL) : '';
+}
+
+function probeMatches(matches, meta, season, episode) {
+  var ordered = [];
+  function take(pred) {
+    matches.forEach(function (m) {
+      if (pred(m) && ordered.indexOf(m) === -1) ordered.push(m);
+    });
+  }
+  take(function (m) { return m.seasonHint === season; });
+  take(function (m) { return m.seasonHint == null; });
+  take(function () { return true; });
+
+  var slice = ordered.slice(0, 5);
+  var i = 0;
+  var seenHub = {};
+  function next() {
+    if (i >= slice.length) return Promise.resolve(null);
+    var item = slice[i++];
+    return siteGet(BASE_URL + '/watch.php?vid=' + item.vid).then(function (html) {
+      var serie = serieUrlFromWatch(html);
+      if (!serie || seenHub[serie]) return next();
+      seenHub[serie] = true;
+      return siteGet(serie, BASE_URL + '/watch.php?vid=' + item.vid).then(function (serieHtml) {
+        if (!hubMatches(serieHtml, meta.targets)) return next();
+        var vid = pickEpisode(parseSeasonBlocks(serieHtml), season, episode, meta.arabic);
+        if (vid) return vid;
+        return findFlat(serieHtml, meta.targets, season, episode, meta.arabic) || next();
+      }, function () { return next(); });
+    }).catch(function () { return next(); });
+  }
+  return next();
+}
+
+function collectSeriesVids(meta, season, episode) {
+  return loadHubs(meta).then(function (hubs) {
+    var vids = [];
+    function add(v) { if (v && vids.indexOf(v) === -1) vids.push(v); }
+    hubs.forEach(function (h) {
+      add(pickEpisode(h.blocks, season, episode, meta.arabic));
+      if (!h.blocks.length) add(findFlat(h.html, meta.targets, season, episode, meta.arabic));
+    });
+    log('hubs ' + hubs.map(function (h) { return h.url.replace(BASE_URL, ''); }).join(' | ') + ' vids=' + vids.join(','));
+    if (vids.length) return vids;
+    return findSeriesMatches(meta, season, episode).then(function (matches) {
+      log('series title hits: ' + matches.length);
+      return probeMatches(matches, meta, season, episode).then(function (probed) {
+        add(probed);
+        matches.forEach(function (m) {
+          if (m.info.episode === episode && m.seasonHint === season) add(m.vid);
+        });
+        if (season === 1) {
+          matches.forEach(function (m) {
+            if (m.info.episode === episode && m.seasonHint == null) add(m.vid);
+          });
+        }
+        return vids;
+      });
+    });
   });
 }
 
 function getSeriesStreams(meta, season, episode, title) {
-  return findSeriesEntries(meta, season, episode).then(function (matched) {
-    log('series entries matched: ' + matched.length +
-        ' (exact=' + matched.filter(function (m) { return !m.partial; }).length +
-        ', partial=' + matched.filter(function (m) { return m.partial; }).length + ')');
-    if (!matched.length) return [];
-    return resolveEpisodeVids(matched, season, episode).then(function (vids) {
-      var list = vids.slice(0, MAX_EPISODE_CANDIDATES);
-      var i = 0;
-      function next() {
-        if (i >= list.length) return Promise.resolve([]);
-        var vid = list[i++];
-        return getServerStreams(vid, title).catch(function (err) {
-          log('servers failed for ' + vid + ': ' + (err && err.message));
-          return [];
-        }).then(function (streams) {
-          return streams.length ? streams : next();
-        });
-      }
-      return next();
-    });
+  return collectSeriesVids(meta, season, episode).then(function (vids) {
+    var list = vids.slice(0, MAX_EPISODE_CANDIDATES);
+    log('episode vids: ' + list.join(', '));
+    if (!list.length) return [];
+    var i = 0;
+    function next() {
+      if (i >= list.length) return Promise.resolve([]);
+      var vid = list[i++];
+      return getServerStreams(vid, title).catch(function (err) {
+        log('servers failed for ' + vid + ': ' + (err && err.message));
+        return [];
+      }).then(function (streams) {
+        return streams.length ? streams : next();
+      });
+    }
+    return next();
   });
 }
 
@@ -1044,5 +1183,5 @@ module.exports = {
   version: '1.1.0',
   supportedTypes: ['movie', 'tv'],
   formats: ['m3u8', 'mp4'],
-  getStreams: getStreams,
+  getStreams: getStreams
 };
