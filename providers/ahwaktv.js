@@ -1,6 +1,7 @@
 var BASE_URL = 'https://yam.ahwaktv.net';
 var PROVIDER_ID = 'ahwaktv';
 var PROVIDER_NAME = 'AhwakTV';
+
 var TMDB_API_KEY = '83d364331c40bfbe29858aeed82f45cc';
 
 var CONTENT_LANG = 'both';
@@ -10,7 +11,7 @@ var MAX_SEARCH_PAGES = 5;
 var MAX_MOVIE_CANDIDATES = 3;
 var MAX_EPISODE_CANDIDATES = 4;
 var MAX_SERVERS = 6;
-var MAX_QUERIES = 8;
+var MAX_QUERIES = 10;
 var SITE_TIMEOUT = 15000;
 var EMBED_TIMEOUT = 12000;
 
@@ -95,26 +96,52 @@ var NOISE_WORDS = normalizedSet([
   'كامل', 'كاملة', 'hd', 'fhd', 'uhd', '4k', 'bluray', 'hdrip', 'webrip', '720p', '1080p',
   'بجودة', 'جودة', 'عالية', 'اون', 'لاين', 'اونلاين', 'مشاهدة', 'مباشرة', 'يوتيوب',
   'complete', 'full', 'watch', 'online', 'streaming', 'blu-ray', 'web-rip',
-  'quality', 'high', 'youtube'
+  'quality', 'high', 'youtube', 'فقط', 'حصريا', 'والاخيره', 'الاخيره'
 ]);
 
 var ORDINALS = {};
 [
-  ['الاول', 1], ['الاولى', 1], ['الثاني', 2], ['الثانية', 2], ['الثالث', 3], ['الثالثة', 3],
-  ['الرابع', 4], ['الرابعة', 4], ['الخامس', 5], ['الخامسة', 5], ['السادس', 6], ['السادسة', 6],
-  ['السابع', 7], ['السابعة', 7], ['الثامن', 8], ['الثامنة', 8], ['التاسع', 9], ['التاسعة', 9],
-  ['العاشر', 10], ['العاشرة', 10], ['الحادي', 11], ['الحادية', 11], ['الثاني', 12], ['الثانية', 12],
-  ['الثالث', 13], ['الثالثة', 13], ['الرابع', 14], ['الرابعة', 14], ['الخامس', 15], ['الخامسة', 15],
-  ['السادس', 16], ['السادسة', 16], ['السابع', 17], ['السابعة', 17], ['الثامن', 18], ['الثامنة', 18],
-  ['التاسع', 19], ['التاسعة', 19], ['العشرون', 20], ['العشرين', 20], ['الحادي', 21], ['الحادية', 21],
-  ['الثاني', 22], ['الثانية', 22], ['الثالث', 23], ['الثالثة', 23], ['الرابع', 24], ['الرابعة', 24],
-  ['الخامس', 25], ['الخامسة', 25], ['السادس', 26], ['السادسة', 26], ['السابع', 27], ['السابعة', 27],
-  ['الثامن', 28], ['الثامنة', 28], ['التاسع', 29], ['التاسعة', 29], ['الثلاثون', 30], ['الثلاثين', 30]
+  ['الاول', 1], ['الاولى', 1],
+  ['الثاني', 2], ['الثانية', 2],
+  ['الثالث', 3], ['الثالثة', 3],
+  ['الرابع', 4], ['الرابعة', 4],
+  ['الخامس', 5], ['الخامسة', 5],
+  ['السادس', 6], ['السادسة', 6],
+  ['السابع', 7], ['السابعة', 7],
+  ['الثامن', 8], ['الثامنة', 8],
+  ['التاسع', 9], ['التاسعة', 9],
+  ['العاشر', 10], ['العاشرة', 10]
 ].forEach(function (p) { ORDINALS[normalizeText(p[0])] = p[1]; });
 
-function numberFromToken(token) {
-  if (/^\d{1,3}$/.test(token)) return parseInt(token, 10);
-  return ORDINALS[token] || null;
+var ORDINAL_WORDS = {
+  1: 'الأول', 2: 'الثاني', 3: 'الثالث', 4: 'الرابع', 5: 'الخامس',
+  6: 'السادس', 7: 'السابع', 8: 'الثامن', 9: 'التاسع', 10: 'العاشر'
+};
+
+function arabicOrdinal(n) {
+  return ORDINAL_WORDS[n] || null;
+}
+
+function readOrdinal(tokens, i) {
+  var t = tokens[i];
+  if (t === undefined || t === null) return null;
+
+  if (ORDINALS[t] !== undefined) {
+    var base = ORDINALS[t];
+    var next = tokens[i + 1];
+    if (next === 'عشر' && base >= 1 && base <= 9) {
+      return { value: base + 10, len: 2 };
+    }
+    if ((next === 'والعشرون' || next === 'والعشرين') && base >= 1 && base <= 9) {
+      return { value: base + 20, len: 2 };
+    }
+    return { value: base, len: 1 };
+  }
+
+  if (t === 'العشرون' || t === 'العشرين') return { value: 20, len: 1 };
+  if (t === 'الثلاثون' || t === 'الثلاثين') return { value: 30, len: 1 };
+
+  return null;
 }
 
 function parseTitle(raw) {
@@ -141,36 +168,43 @@ function parseTitle(raw) {
     for (var e = 0; e < tokens.length; e++) {
       if (EPISODE_WORDS[tokens[e]]) { epIdx = e; break; }
     }
+
     if (epIdx !== -1) {
       var afterEp = tokens[epIdx + 1];
-      if (afterEp) {
-        if (/^\d+$/.test(afterEp)) {
-          info.episode = parseInt(afterEp, 10);
-          tokens.splice(epIdx, 2);
-        } else {
-          var ord = numberFromToken(afterEp);
-          if (ord) {
-            info.episode = ord;
-            tokens.splice(epIdx, 2);
-          }
-        }
-      }
-    }
+      if (afterEp && /^\d+$/.test(afterEp)) {
+        info.episode = parseInt(afterEp, 10);
+        tokens.splice(epIdx, 2);
 
-    if (info.episode !== null) {
-      for (var oi = 0; oi < tokens.length; oi++) {
-        var ordVal = numberFromToken(tokens[oi]);
-        if (ordVal !== null && ordVal === info.episode) {
-          tokens.splice(oi, 1);
+        var ci = epIdx;
+        while (ci < tokens.length) {
+          var ord = readOrdinal(tokens, ci);
+          if (ord && ord.value === info.episode) {
+            tokens.splice(ci, ord.len);
+            continue;
+          }
+          if (tokens[ci] === 'والاخيره' || tokens[ci] === 'الاخيره') {
+            tokens.splice(ci, 1);
+            continue;
+          }
           break;
+        }
+      } else {
+        var epOrd = readOrdinal(tokens, epIdx + 1);
+        if (epOrd) {
+          info.episode = epOrd.value;
+          tokens.splice(epIdx, 1 + epOrd.len);
         }
       }
     }
 
     for (var i = 0; i < tokens.length - 1; i++) {
       if (SEASON_WORDS[tokens[i]]) {
-        var n = numberFromToken(tokens[i + 1]);
-        if (n) { info.season = n; tokens.splice(i, 2); break; }
+        var sOrd = readOrdinal(tokens, i + 1);
+        if (sOrd) {
+          info.season = sOrd.value;
+          tokens.splice(i, 1 + sOrd.len);
+          break;
+        }
       }
     }
 
@@ -192,30 +226,6 @@ function parseTitle(raw) {
 
   info.name = tokens.filter(function (t) { return !NOISE_WORDS[t]; }).join(' ');
   return info;
-}
-
-function bigramMap(str) {
-  var s = str.replace(/ /g, '');
-  var map = {};
-  var size = 0;
-  for (var i = 0; i < s.length - 1; i++) {
-    var g = s.substr(i, 2);
-    map[g] = (map[g] || 0) + 1;
-    size++;
-  }
-  return { map: map, size: size };
-}
-
-function diceScore(a, b) {
-  if (a === b) return 1;
-  var x = bigramMap(a);
-  var y = bigramMap(b);
-  if (!x.size || !y.size) return 0;
-  var common = 0;
-  Object.keys(x.map).forEach(function (g) {
-    if (y.map[g]) common += Math.min(x.map[g], y.map[g]);
-  });
-  return (2 * common) / (x.size + y.size);
 }
 
 function asciiSafe(value) {
@@ -385,12 +395,16 @@ function buildQueries(title, meta, type, season, episode) {
 
   add(title);
 
-  if (type === 'tv' && season && episode) {
-    add(title + ' الحلقة ' + episode);
-    add(title + ' الموسم ' + season + ' الحلقة ' + episode);
-    if (season === 1) {
-      add(title + ' الموسم الأول الحلقة ' + episode);
+  if (type === 'tv' && season) {
+    var arSeason = arabicOrdinal(season);
+    if (episode) {
+      add(title + ' الحلقة ' + episode);
+      add(title + ' الموسم ' + season + ' الحلقة ' + episode);
+      if (arSeason) add(title + ' الموسم ' + arSeason + ' الحلقة ' + episode);
+      add(title + ' ' + season + ' الحلقة ' + episode);
     }
+    if (arSeason) add(title + ' الموسم ' + arSeason);
+    add(title + ' ' + season);
   }
 
   if (type === 'movie' && meta.year) {
@@ -573,15 +587,15 @@ function findSeriesEntries(meta, season, episode) {
       var match = strictTitleMatch(info.name, meta.targets);
       if (!match.matched) return;
 
-      var entrySeason = info.season;
-      if (entrySeason !== null && entrySeason !== season) return;
+      var effectiveSeason = info.season === null ? 1 : info.season;
+      if (effectiveSeason !== season) return;
 
       seen[entry.vid] = true;
       matched.push({
         vid: entry.vid,
         title: entry.title,
         info: info,
-        entrySeason: entrySeason
+        entrySeason: info.season
       });
       if (info.episode === episode) haveExact = true;
     });
@@ -660,8 +674,9 @@ function pickFromSections(parsed, season, episode, entrySeason) {
   if (!parsed || parsed.ambiguous) return null;
   var section = null;
   parsed.sections.forEach(function (s) { if (s.season === season) section = s; });
-  if (!section && parsed.sections.length === 1 && (season === 1 || entrySeason === season)) {
-    section = parsed.sections[0];
+  if (!section && parsed.sections.length === 1) {
+    var es = entrySeason === null ? 1 : entrySeason;
+    if (season === 1 || es === season) section = parsed.sections[0];
   }
   if (!section) return null;
   for (var i = 0; i < section.episodes.length; i++) {
@@ -672,13 +687,17 @@ function pickFromSections(parsed, season, episode, entrySeason) {
 
 function resolveEpisodeVids(matched, season, episode) {
   var direct = matched.filter(function (e) {
-    return e.info.episode === episode &&
-      (e.entrySeason === season || (e.entrySeason === null && season === 1));
+    var es = e.entrySeason === null ? 1 : e.entrySeason;
+    return e.info.episode === episode && es === season;
   });
   if (direct.length === 1) return Promise.resolve([direct[0].vid]);
 
   var rep = matched[0];
-  matched.forEach(function (e) { if (rep.entrySeason !== season && e.entrySeason === season) rep = e; });
+  matched.forEach(function (e) {
+    var es = e.entrySeason === null ? 1 : e.entrySeason;
+    var rs = rep.entrySeason === null ? 1 : rep.entrySeason;
+    if (rs !== season && es === season) rep = e;
+  });
 
   return fetchSeriesSections(rep.vid).then(function (parsed) {
     var hit = pickFromSections(parsed, season, episode, rep.entrySeason);
