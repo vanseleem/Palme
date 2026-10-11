@@ -1,7 +1,7 @@
 var BASE = "https://vod.q-drama.com";
 var UA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Mobile Safari/537.36";
 var TMDB_API_KEY = "83d364331c40bfbe29858aeed82f45cc";
-var MAX_SERVERS = 12;
+var MAX_SERVERS = 3;
 var MIRROR_TIMEOUT = 15000;
 var BAD_HOST = /(^|\.)(q-drama\.com|facebook\.com|twitter\.com|google\.com|googleapis\.com|gstatic\.com|w3\.org|schema\.org|cloudflare\.com|jquery\.com|jsdelivr\.net|t\.me|telegram\.org|themoviedb\.org)$/i;
 
@@ -374,8 +374,8 @@ function makeStream(url, label, playerUrl) {
   }
 
   return {
-    name: "🎖️ QDrama",
-    title: label ? "🎖️ QDrama \u2022 " + label : "🌀 QDrama",
+    name: "QDrama",
+    title: label ? "QDrama \u2022 " + label : "QDrama",
     url: url,
     quality: qualityFromUrl(url),
     referer: streamReferer,
@@ -440,8 +440,8 @@ function resolveVid(vid) {
         if (seenHosts2[host]) return;
         seenHosts2[host] = 1;
         fallbacks.push({
-          name: "🎖️ QDrama",
-          title: "🎖️ QDrama (Embed) \u2022 " + r.mirror.label,
+          name: "QDrama",
+          title: "QDrama (Embed) \u2022 " + r.mirror.label,
           url: r.mirror.embed,
           quality: "Auto",
           type: "iframe",
