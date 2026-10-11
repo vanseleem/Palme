@@ -3,21 +3,6 @@
   "version": "1.0.0",
   "scrapers": [
     {
-      "id": "kirmalk",
-      "name": "🇯🇴 Kirmalk",
-      "description": "Movies and TV series via Vortex backend",
-      "version": "1.0.0",
-      "author": "vanseleem",
-      "supportedTypes": ["movie", "tv"],
-      "filename": "providers/kirmalk.js",
-      "enabled": true,
-      "hasSettings": false,
-      "formats": ["m3u8"],
-      "contentLanguage": ["en"],
-      "limited": false,
-      "supportsExternalPlayer": true
-    },
-    {
       "id": "nebula",
       "name": "🌀 Nebula",
       "description": "Movies and TV series via Vortex backend",
@@ -160,6 +145,21 @@
       "supportsExternalPlayer": true
     },
     {
+      "id": "kirmalk",
+      "name": "🇯🇴 Kirmalk",
+      "description": "Movies and TV series via Vortex backend",
+      "version": "1.0.0",
+      "author": "vanseleem",
+      "supportedTypes": ["movie", "tv"],
+      "filename": "providers/kirmalk.js",
+      "enabled": true,
+      "hasSettings": false,
+      "formats": ["m3u8"],
+      "contentLanguage": ["en"],
+      "limited": false,
+      "supportsExternalPlayer": true
+    },
+    {
       "id": "dramacafe",
       "name": "☕ DramaCafe",
       "description": "Arabic movies and series from DramaCafe",
@@ -174,20 +174,6 @@
       "supportsExternalPlayer": true
     },
     {
-      "id": "ahwaktv",
-      "name": " 🤍 AhwakTV",
-      "description": "Arabic and international movies and TV series",
-      "version": "1.0.0",
-      "author": "vanseleem",
-      "supportedTypes": ["movie", "tv"],
-      "filename": "providers/ahwaktv.js",
-      "enabled": true,
-      "formats": ["mp4", "m3u8"],
-      "contentLanguage": ["ar", "en", "tr"],
-      "limited": false,
-      "supportsExternalPlayer": true
-    },
-    {
       "id": "aravid",
       "name": "🎬 Aravid",
       "description": "Arabic movies and series",
@@ -197,6 +183,20 @@
       "filename": "providers/aravid.js",
       "enabled": true,
       "formats": ["iframe", "mp4", "m3u8"],
+      "contentLanguage": ["ar"],
+      "limited": false,
+      "supportsExternalPlayer": true
+    },
+    {
+      "id": "akwam",
+      "name": "🏅 Akwam",
+      "description": "Arabic movie and TV streaming provider",
+      "version": "1.0.0",
+      "author": "vanseleem",
+      "supportedTypes": ["movie", "tv"],
+      "filename": "providers/akwam.js",
+      "enabled": true,
+      "formats": ["mp4"],
       "contentLanguage": ["ar"],
       "limited": false,
       "supportsExternalPlayer": true
@@ -230,16 +230,16 @@
       "supportsExternalPlayer": true
     },
     {
-      "id": "akwam",
-      "name": "🏅 Akwam",
-      "description": "Arabic movie and TV streaming provider",
+      "id": "ahwaktv",
+      "name": " 🤍 AhwakTV",
+      "description": "Arabic and international movies and TV series",
       "version": "1.0.0",
       "author": "vanseleem",
       "supportedTypes": ["movie", "tv"],
-      "filename": "providers/akwam.js",
+      "filename": "providers/ahwaktv.js",
       "enabled": true,
-      "formats": ["mp4"],
-      "contentLanguage": ["ar"],
+      "formats": ["mp4", "m3u8"],
+      "contentLanguage": ["ar", "en", "tr"],
       "limited": false,
       "supportsExternalPlayer": true
     }
