@@ -1,7 +1,7 @@
 var BASE = "https://vod.q-drama.com";
 var UA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Mobile Safari/537.36";
 var TMDB_API_KEY = "83d364331c40bfbe29858aeed82f45cc";
-var MAX_SERVERS = 3;
+var MAX_SERVERS = 14;
 var MIRROR_TIMEOUT = 15000;
 var SEARCH_PAGES = 3;
 var BAD_HOST = /(^|\.)(q-drama\.com|qdrama\.com|qfilm\.tv|facebook\.com|twitter\.com|google\.com|googleapis\.com|gstatic\.com|w3\.org|schema\.org|cloudflare\.com|jquery\.com|jsdelivr\.net|t\.me|telegram\.org|themoviedb\.org)$/i;
