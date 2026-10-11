@@ -1,7 +1,6 @@
 var BASE = "https://akwam.ss";
 var UA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Mobile Safari/537.36";
 var TMDB_API_KEY = "83d364331c40bfbe29858aeed82f45cc";
-var MAX_SERVERS = 4;
 
 function fetchText(url, referer) {
   url = String(url).replace(/[^\x00-\x7F]/g, function(c) {
@@ -56,6 +55,49 @@ function similarity(a, b) {
   var common = 0;
   aa.forEach(function(x) { if (bb.has(x)) common++; });
   return common / Math.max(aa.size, bb.size);
+}
+
+function qualityRank(q) {
+  var s = String(q || "").toLowerCase();
+  if (/2160|4k/.test(s)) return 6;
+  if (/1440/.test(s)) return 5;
+  if (/1080/.test(s)) return 4;
+  if (/720/.test(s)) return 3;
+  if (/auto/.test(s)) return 3;
+  if (/480/.test(s)) return 2;
+  if (/360/.test(s)) return 1;
+  if (/240/.test(s)) return 0;
+  return 0;
+}
+
+function groupSourcesByProvider(sources) {
+  var byHost = {};
+  var order = [];
+  sources.forEach(function(s) {
+    var m = String(s.url).match(/^https?:\/\/([^\/?#:]+)/i);
+    var host = m ? m[1].toLowerCase().replace(/^www\./, "") : "unknown";
+    if (!byHost[host]) {
+      byHost[host] = [];
+      order.push(host);
+    }
+    byHost[host].push(s);
+  });
+  var out = [];
+  order.forEach(function(host) {
+    var group = byHost[host];
+    group.sort(function(a, b) {
+      return qualityRank(b.quality) - qualityRank(a.quality);
+    });
+    var best = group[0];
+    var showQ = best.quality && best.quality !== "Unknown" && best.quality !== "Auto";
+    out.push({
+      name: "Akwam",
+      title: "Akwam • " + host + (showQ ? " " + best.quality : ""),
+      url: best.url,
+      quality: best.quality
+    });
+  });
+  return out;
 }
 
 function getSearchTitle(tmdbId, mediaType) {
@@ -201,12 +243,7 @@ function extractSources(html) {
     seen.add(url);
     var qualityMatch = source.match(/\bsize=["']([^"']+)["']/i) || source.match(/\blabel=["']([^"']+)["']/i);
     var quality = qualityMatch ? qualityMatch[1] : "Unknown";
-    streams.push({
-      name: "Akwam",
-      title: quality === "Unknown" ? "Akwam" : "Akwam " + quality,
-      url: url,
-      quality: quality
-    });
+    streams.push({ url: url, quality: quality });
   }
   return streams;
 }
@@ -246,7 +283,7 @@ function getMovieStreams(tmdbId) {
             return extractSources(watchHtml);
           }).catch(function() { return []; });
         }));
-      }).then(flattenOnce);
+      }).then(flattenOnce).then(groupSourcesByProvider);
     });
   }).catch(function(err) {
     console.error("[Akwam] Movie error:", err.message);
@@ -366,7 +403,7 @@ function getTvStreams(tmdbId, season, episode) {
             console.error("[Akwam] Episode page failed:", err.message);
             return [];
           });
-        })).then(flattenOnce);
+        })).then(flattenOnce).then(groupSourcesByProvider);
       });
     });
   }).catch(function(err) {
