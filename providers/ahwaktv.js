@@ -96,7 +96,7 @@ var NOISE_WORDS = normalizedSet([
   'كامل', 'كاملة', 'hd', 'fhd', 'uhd', '4k', 'bluray', 'hdrip', 'webrip', '720p', '1080p',
   'بجودة', 'جودة', 'عالية', 'اون', 'لاين', 'اونلاين', 'مشاهدة', 'مباشرة', 'يوتيوب',
   'complete', 'full', 'watch', 'online', 'streaming', 'blu-ray', 'web-rip',
-  'quality', 'high', 'youtube', 'فقط', 'حصريا', 'والاخيره', 'الاخيره'
+  'quality', 'high', 'youtube', 'فقط', 'حصريا', 'والاخيره', 'الاخيره', 'مصري', 'كوميديا'
 ]);
 
 var ORDINALS = {};
@@ -115,7 +115,12 @@ var ORDINALS = {};
 
 var ORDINAL_WORDS = {
   1: 'الأول', 2: 'الثاني', 3: 'الثالث', 4: 'الرابع', 5: 'الخامس',
-  6: 'السادس', 7: 'السابع', 8: 'الثامن', 9: 'التاسع', 10: 'العاشر'
+  6: 'السادس', 7: 'السابع', 8: 'الثامن', 9: 'التاسع', 10: 'العاشر',
+  11: 'الحادي عشر', 12: 'الثاني عشر', 13: 'الثالث عشر', 14: 'الرابع عشر', 15: 'الخامس عشر',
+  16: 'السادس عشر', 17: 'السابع عشر', 18: 'الثامن عشر', 19: 'التاسع عشر', 20: 'العشرون',
+  21: 'الحادي والعشرون', 22: 'الثاني والعشرون', 23: 'الثالث والعشرون', 24: 'الرابع والعشرون',
+  25: 'الخامس والعشرون', 26: 'السادس والعشرون', 27: 'السابع والعشرون', 28: 'الثامن والعشرون',
+  29: 'التاسع والعشرون', 30: 'الثلاثون'
 };
 
 function arabicOrdinal(n) {
@@ -144,9 +149,14 @@ function readOrdinal(tokens, i) {
   return null;
 }
 
+function stripParentheses(text) {
+  return text.replace(/\([^)]*\)/g, ' ').replace(/\[[^\]]*\]/g, ' ');
+}
+
 function parseTitle(raw) {
   var info = { kind: null, name: '', year: null, season: null, episode: null, dubbed: false, subbed: false };
-  var tokens = normalizeText(raw).split(' ').filter(Boolean);
+  var cleaned = stripParentheses(raw);
+  var tokens = normalizeText(cleaned).split(' ').filter(Boolean);
 
   var kindIdx = -1;
   for (var k = 0; k < Math.min(tokens.length, 3); k++) {
@@ -186,6 +196,10 @@ function parseTitle(raw) {
             tokens.splice(ci, 1);
             continue;
           }
+          if (tokens[ci] === 'و' && tokens[ci + 1] === 'الاخيره') {
+            tokens.splice(ci, 2);
+            continue;
+          }
           break;
         }
       } else {
@@ -197,12 +211,27 @@ function parseTitle(raw) {
       }
     }
 
-    for (var i = 0; i < tokens.length - 1; i++) {
+    for (var i = 0; i < tokens.length; i++) {
       if (SEASON_WORDS[tokens[i]]) {
         var sOrd = readOrdinal(tokens, i + 1);
         if (sOrd) {
           info.season = sOrd.value;
           tokens.splice(i, 1 + sOrd.len);
+          break;
+        }
+        if (/^\d{1,2}$/.test(tokens[i + 1])) {
+          info.season = parseInt(tokens[i + 1], 10);
+          tokens.splice(i, 2);
+          break;
+        }
+      }
+    }
+
+    if (info.season === null) {
+      for (var si = 0; si < tokens.length; si++) {
+        if (/^\d{1,2}$/.test(tokens[si]) && si > 0 && si < tokens.length - 1) {
+          info.season = parseInt(tokens[si], 10);
+          tokens.splice(si, 1);
           break;
         }
       }
@@ -402,9 +431,13 @@ function buildQueries(title, meta, type, season, episode) {
       add(title + ' الموسم ' + season + ' الحلقة ' + episode);
       if (arSeason) add(title + ' الموسم ' + arSeason + ' الحلقة ' + episode);
       add(title + ' ' + season + ' الحلقة ' + episode);
+      add(title + ' الجزء ' + season + ' الحلقة ' + episode);
+      if (arSeason) add(title + ' الجزء ' + arSeason + ' الحلقة ' + episode);
     }
     if (arSeason) add(title + ' الموسم ' + arSeason);
     add(title + ' ' + season);
+    add(title + ' الجزء ' + season);
+    if (arSeason) add(title + ' الجزء ' + arSeason);
   }
 
   if (type === 'movie' && meta.year) {
@@ -421,6 +454,7 @@ function buildQueries(title, meta, type, season, episode) {
     if (type === 'tv' && season && episode) {
       add(meta.englishTitle + ' الحلقة ' + episode);
       add(meta.englishTitle + ' الموسم ' + season + ' الحلقة ' + episode);
+      add(meta.englishTitle + ' الجزء ' + season + ' الحلقة ' + episode);
     }
   }
 
@@ -439,7 +473,10 @@ function strictTitleMatch(parsedName, targets) {
 
     if (parsedStr === targetStr) return { matched: true, targetIndex: i };
 
-    if (targetTokens.length === 1) continue;
+    if (targetTokens.length === 1) {
+      if (parsedTokens.indexOf(targetTokens[0]) !== -1) return { matched: true, targetIndex: i, partial: true };
+      continue;
+    }
 
     for (var start = 0; start <= parsedTokens.length - targetTokens.length; start++) {
       var ok = true;
@@ -595,7 +632,8 @@ function findSeriesEntries(meta, season, episode) {
         vid: entry.vid,
         title: entry.title,
         info: info,
-        entrySeason: info.season
+        entrySeason: info.season,
+        partial: !!match.partial
       });
       if (info.episode === episode) haveExact = true;
     });
@@ -604,7 +642,7 @@ function findSeriesEntries(meta, season, episode) {
 
   var queries = buildQueries(meta.displayTitle, meta, 'tv', season, episode);
   return searchQueries(queries, onEntries, function () {
-    return matched.some(function (m) { return m.info.episode === episode; });
+    return matched.some(function (m) { return m.info.episode === episode && !m.partial; });
   }).then(function () { return matched; });
 }
 
@@ -688,7 +726,7 @@ function pickFromSections(parsed, season, episode, entrySeason) {
 function resolveEpisodeVids(matched, season, episode) {
   var direct = matched.filter(function (e) {
     var es = e.entrySeason === null ? 1 : e.entrySeason;
-    return e.info.episode === episode && es === season;
+    return e.info.episode === episode && es === season && !e.partial;
   });
   if (direct.length === 1) return Promise.resolve([direct[0].vid]);
 
@@ -712,7 +750,9 @@ function resolveEpisodeVids(matched, season, episode) {
 
 function getSeriesStreams(meta, season, episode, title) {
   return findSeriesEntries(meta, season, episode).then(function (matched) {
-    log('series entries matched: ' + matched.length);
+    log('series entries matched: ' + matched.length +
+        ' (exact=' + matched.filter(function (m) { return !m.partial; }).length +
+        ', partial=' + matched.filter(function (m) { return m.partial; }).length + ')');
     if (!matched.length) return [];
     return resolveEpisodeVids(matched, season, episode).then(function (vids) {
       var list = vids.slice(0, MAX_EPISODE_CANDIDATES);
