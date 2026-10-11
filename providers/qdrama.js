@@ -1,664 +1,554 @@
-/**
- * Q-Drama Provider for Nuvio
- * Arabic movies and TV series from vod.q-drama.com
- * Fixed version — search + episode lookup + fallback server parsing
- */
+var BASE = "https://vod.q-drama.com";
+var UA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Mobile Safari/537.36";
+var TMDB_API_KEY = "83d364331c40bfbe29858aeed82f45cc";
+var MIRROR_TIMEOUT = 15000;
+var BAD_HOST = /(^|\.)(q-drama\.com|facebook\.com|twitter\.com|google\.com|googleapis\.com|gstatic\.com|w3\.org|schema\.org|cloudflare\.com|jquery\.com|jsdelivr\.net|t\.me|telegram\.org|themoviedb\.org)$/i;
 
-var PROVIDER_ID = "qdrama";
-var PROVIDER_NAME = "QDrama";
-var BASE_URL = "https://vod.q-drama.com";
-
-// ─────────────────────────────────────────────────────────────
-// CONFIGURATION
-// ─────────────────────────────────────────────────────────────
-var UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36";
-var FETCH_TIMEOUT_MS = 20000;
-var MAX_FETCHES = 12;
-
-// ─────────────────────────────────────────────────────────────
-// LOGGING
-// ─────────────────────────────────────────────────────────────
-function log(m) { console.log("[" + PROVIDER_NAME + "] " + m); }
-function snip(t, n) { return String(t || "").substring(0, n || 200).replace(/\s+/g, " "); }
-
-// ─────────────────────────────────────────────────────────────
-// HTTP LAYER
-// ─────────────────────────────────────────────────────────────
-function withTimeout(promise, ms, label) {
-    return new Promise(function (resolve, reject) {
-        var done = false;
-        var t = setTimeout(function () {
-            if (!done) { done = true; reject(new Error((label || "request") + " timeout")); }
-        }, ms);
-        promise.then(function (v) {
-            if (!done) { done = true; clearTimeout(t); resolve(v); }
-        }, function (e) {
-            if (!done) { done = true; clearTimeout(t); reject(e); }
-        });
+function fetchText(url, referer) {
+  url = String(url).replace(/[^\x00-\x7F]/g, function(c) {
+    return encodeURIComponent(c);
+  });
+  var headers = {
+    "User-Agent": UA,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "ar,en-US;q=0.7,en;q=0.3"
+  };
+  if (referer) headers["Referer"] = String(referer).replace(/[^\x00-\x7F]/g, function(c) {
+    return encodeURIComponent(c);
+  });
+  console.log("[QDrama] → " + url + (referer ? " | ref=" + referer : ""));
+  return fetch(url, { headers: headers, redirect: "follow" }).then(function(r) {
+    console.log("[QDrama] ← " + r.status + " " + (r.url || url));
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    return r.text().then(function(t) {
+      console.log("[QDrama] ← len=" + t.length);
+      // Cloudflare / bot-wall detection — bail loudly instead of silently
+      if (t.length < 20000 && /cf-chl|challenge-platform|cf_chl_opt|Just a moment|Attention Required|DDoS protection/i.test(t)) {
+        console.log("[QDrama] ⚠ CLOUDFLARE CHALLENGE — real HTML not returned");
+        throw new Error("Cloudflare challenge");
+      }
+      // Empty / truncated shell
+      if (t.length < 300) {
+        console.log("[QDrama] ⚠ suspiciously short body: " + t.slice(0, 200).replace(/\s+/g, " "));
+      }
+      return t;
     });
+  });
 }
 
-function request(url, headers) {
-    return withTimeout(
-        fetch(url, {
-            method: "GET",
-            headers: headers || {},
-            redirect: "follow"
-        }).then(function (r) {
-            return r.text().then(function (t) {
-                return { ok: r.ok, status: r.status, text: t, url: r.url || url };
-            });
-        }),
-        FETCH_TIMEOUT_MS,
-        url.split("?")[0]
-    );
+function decodeHtml(str) {
+  return String(str || "")
+    .replace(/&amp;/g, "&")
+    .replace(/&quot;/g, '"')
+    .replace(/&#039;/g, "'")
+    .replace(/&#39;/g, "'")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">");
 }
 
-function getPage(url, referer) {
-    var h = {
-        "User-Agent": UA,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "ar,en-US;q=0.7,en;q=0.3",
-        "Referer": referer || (BASE_URL + "/")
-    };
-    log("→ " + url);
-    return request(url, h).then(function (r) {
-        log("← " + r.status + " len=" + r.text.length + " final=" + r.url);
-        if (!r.ok) throw new Error("HTTP " + r.status);
-        return r;
-    });
+function stripHtml(str) {
+  return decodeHtml(String(str || ""))
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
-// ─────────────────────────────────────────────────────────────
-// HELPERS
-// ─────────────────────────────────────────────────────────────
-function pad2(n) { return n < 10 ? "0" + n : String(n); }
-
-function absUrl(base, rel) {
-    rel = String(rel).trim();
-    if (/^https?:\/\//i.test(rel)) return rel;
-    if (/^\/\//.test(rel)) return "https:" + rel;
-    var clean = base.split("#")[0].split("?")[0];
-    var m = /^(https?:\/\/[^\/]+)(\/.*)?$/i.exec(clean);
-    if (!m) return rel;
-    var origin = m[1];
-    if (rel.charAt(0) === "/") return origin + rel;
-    var parts = (m[2] || "/").split("/");
-    parts.pop();
-    rel.split("/").forEach(function (seg) {
-        if (seg === "..") { if (parts.length > 1) parts.pop(); }
-        else if (seg !== ".") parts.push(seg);
-    });
-    return origin + parts.join("/");
+function normalizeTitle(str) {
+  return String(str || "")
+    .toLowerCase()
+    .replace(/[^a-zA-Z0-9\u0600-\u06FF]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
-function uniq(arr) {
-    var seen = {}, out = [];
-    arr.forEach(function (x) {
-        var k = typeof x === "string" ? x : x.url;
-        if (seen[k]) return;
-        seen[k] = true;
-        out.push(x);
-    });
-    return out;
+function cleanEscapes(s) {
+  return String(s || "")
+    .replace(/\\u002F/gi, "/")
+    .replace(/\\u0026/gi, "&")
+    .replace(/\\\//g, "/")
+    .replace(/&amp;/g, "&");
 }
 
-function stripHtml(s) {
-    return String(s || "").replace(/<[^>]*>/g, "").replace(/&amp;/g, "&").replace(/&quot;/g, '"').trim();
+function originOf(u) {
+  var m = String(u || "").match(/^(https?:\/\/[^\/?#]+)/i);
+  return m ? m[1] : BASE;
 }
 
-// ─────────────────────────────────────────────────────────────
-// ARABIC NORMALIZATION (script-aware)
-// ─────────────────────────────────────────────────────────────
-var ARABIC_RE = /[\u0600-\u06FF]/;
-
-function hasArabic(s) { return ARABIC_RE.test(String(s || "")); }
-function hasLatin(s) { return /[A-Za-z]/.test(String(s || "")); }
-
-function normalizeTitle(s) {
-    s = String(s || "").trim();
-    if (!s) return "";
-    if (hasArabic(s)) {
-        s = s
-            .replace(/[أإآٱ]/g, "ا")
-            .replace(/ى/g, "ي")
-            .replace(/ؤ/g, "و")
-            .replace(/ئ/g, "ي")
-            .replace(/ة/g, "ه")
-            .replace(/[\u064B-\u0652\u0670]/g, "")
-            .replace(/\u0640/g, "");
+function withTimeout(promise, ms, fallback) {
+  if (typeof setTimeout !== "function") return promise;
+  return new Promise(function(resolve) {
+    var done = false;
+    var t = setTimeout(function() {
+      if (!done) { done = true; resolve(fallback); }
+    }, ms);
+    function finish(v) {
+      if (done) return;
+      done = true;
+      if (typeof clearTimeout === "function") clearTimeout(t);
+      resolve(v);
     }
-    if (hasLatin(s)) {
-        s = s.toLowerCase()
-            .replace(/[^\w\s\u0600-\u06FF]/g, " ")
-            .replace(/\s+/g, " ");
-    }
-    return s.replace(/\s+/g, " ").trim();
+    promise.then(finish, function() { finish(fallback); });
+  });
 }
 
 function similarity(a, b) {
-    a = normalizeTitle(a);
-    b = normalizeTitle(b);
-    if (!a || !b) return 0;
-    if (a === b) return 100;
-    if (a.indexOf(b) !== -1 || b.indexOf(a) !== -1) {
-        var shorter = Math.min(a.length, b.length);
-        var longer = Math.max(a.length, b.length);
-        return Math.round(40 + 50 * (shorter / longer));
-    }
-    var aw = a.split(/\s+/), bw = b.split(/\s+/);
-    var hits = 0;
-    aw.forEach(function (w) { if (w.length > 2 && bw.indexOf(w) !== -1) hits++; });
-    return hits ? Math.round(30 * hits / Math.max(aw.length, bw.length)) : 0;
+  a = normalizeTitle(a);
+  b = normalizeTitle(b);
+  if (!a || !b) return 0;
+  if (a === b) return 1;
+  if (a.indexOf(b) !== -1 || b.indexOf(a) !== -1) {
+    return 0.5 + 0.4 * Math.min(a.length, b.length) / Math.max(a.length, b.length);
+  }
+  var aa = a.split(" ");
+  var bb = b.split(" ");
+  var setB = {};
+  bb.forEach(function(x) { setB[x] = 1; });
+  var common = 0;
+  aa.forEach(function(x) { if (setB[x]) common++; });
+  return common / Math.max(aa.length, bb.length);
 }
 
-// ─────────────────────────────────────────────────────────────
-// PACKED JS / BASE64 DECODERS
-// ─────────────────────────────────────────────────────────────
-var B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-function b64decode(s) {
-    s = String(s).replace(/-/g, "+").replace(/_/g, "/").replace(/[^A-Za-z0-9+\/]/g, "");
-    var out = "";
-    for (var i = 0; i < s.length; i += 4) {
-        var a = B64.indexOf(s.charAt(i));
-        var b = B64.indexOf(s.charAt(i + 1));
-        var c = i + 2 < s.length ? B64.indexOf(s.charAt(i + 2)) : -1;
-        var d = i + 3 < s.length ? B64.indexOf(s.charAt(i + 3)) : -1;
-        if (a < 0 || b < 0) break;
-        out += String.fromCharCode(((a << 2) | (b >> 4)) & 255);
-        if (c >= 0) out += String.fromCharCode((((b & 15) << 4) | (c >> 2)) & 255);
-        if (d >= 0) out += String.fromCharCode((((c & 3) << 6) | d) & 255);
-    }
-    return out;
+function cleanSiteTitle(str) {
+  var s = decodeHtml(String(str || ""))
+    .replace(/مشاهدة|فيلم|مسلسل|مترجم[ةه]?|مدبلج[ةه]?|اون\s*لاين|اونلاين|أون\s*لاين|كامل[ةه]?|\bHD\b/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  var noYear = s.replace(/\(?\b(?:19|20)\d{2}\b\)?/g, " ").replace(/\s+/g, " ").trim();
+  return noYear || s;
 }
 
-function unpack(p, a, c, k) {
-    function e(n) {
-        return (n < a ? "" : e(parseInt(n / a, 10))) + ((n = n % a) > 35 ? String.fromCharCode(n + 29) : n.toString(36));
+function scoreResult(r, titles, year, isTv) {
+  var cleaned = cleanSiteTitle(r.title);
+  var s = 0;
+  titles.forEach(function(t) {
+    var sc = Math.max(similarity(cleaned, t), similarity(r.title, t) * 0.9);
+    if (sc > s) s = sc;
+  });
+  if (!isTv && year) {
+    var ys = String(r.title).match(/\b(?:19|20)\d{2}\b/g);
+    if (ys) {
+      var ok = ys.some(function(y) { return Math.abs(Number(y) - Number(year)) <= 1; });
+      s = ok ? Math.min(1, s + 0.1) : s * 0.5;
     }
-    var d = {};
-    while (c--) d[e(c)] = k[c] || e(c);
-    p = p.replace(/\\'/g, "'").replace(/\\\\/g, "\\");
-    return p.replace(/\b\w+\b/g, function (w) { return d[w] === undefined ? w : d[w]; });
+  }
+  return s;
 }
 
-function unpackAll(text) {
-    var out = [];
-    var re = /eval\(function\(p,a,c,k,e,[dr]\)\{[\s\S]*?\}\('([\s\S]*?)',\s*(\d+)\s*,\s*(\d+)\s*,\s*'([\s\S]*?)'\.split\('\|'\)/g;
-    var m;
-    while ((m = re.exec(text))) {
-        try { out.push(unpack(m[1], parseInt(m[2], 10), parseInt(m[3], 10), m[4].split("|"))); } catch (e) { /* skip */ }
-    }
-    return out;
-}
+function getTmdbTitles(tmdbId, mediaType) {
+  var type = mediaType === "tv" ? "tv" : "movie";
+  var langs = ["ar", "en"];
+  var titles = [];
+  var year = null;
 
-// ─────────────────────────────────────────────────────────────
-// SEARCH
-// ─────────────────────────────────────────────────────────────
-function searchQDrama(query) {
-    if (!query || !String(query).trim()) return Promise.resolve([]);
-    var url = BASE_URL + "/search.php?keywords=" + encodeURIComponent(query) + "&video-id=";
-    log("SEARCH: " + query);
-
-    return getPage(url).then(function (r) {
-        var html = r.text;
-        var results = [];
-        var m;
-
-        log("SEARCH watch.php hits: " + (html.match(/watch\.php/g) || []).length);
-
-        // Robust: any anchor whose href contains watch.php?vid=
-        var re = /<a\b[^>]*href\s*=\s*["']([^"']*watch\.php\?vid=[^"']+)["'][^>]*>/gi;
-        while ((m = re.exec(html))) {
-            var href = m[1];
-            var vidM = /vid=([A-Za-z0-9]+)/i.exec(href);
-            if (!vidM) continue;
-            var titleM = /title\s*=\s*["']([^"']*)["']/i.exec(m[0]);
-            var title = titleM ? stripHtml(titleM[1]) : "";
-            if (!title) {
-                var tail = html.substring(m.index, m.index + 600);
-                var h3 = /<h3[^>]*>([\s\S]*?)<\/h3>/i.exec(tail);
-                if (h3) title = stripHtml(h3[1]);
-            }
-            if (!title || title.length < 2) continue;
-            var full = absUrl(BASE_URL, href);
-            results.push({ vid: vidM[1], title: title, url: full });
+  return langs.reduce(function(chain, lang) {
+    return chain.then(function() {
+      var apiUrl = "https://api.themoviedb.org/3/" + type + "/" + encodeURIComponent(tmdbId) + "?api_key=" + TMDB_API_KEY + "&language=" + lang;
+      return fetch(apiUrl).then(function(r) { return r.json(); }).then(function(data) {
+        var title = type === "movie" ? (data.title || data.original_title) : (data.name || data.original_name);
+        if (title && titles.indexOf(title) === -1) titles.push(title);
+        if (!year) {
+          var dateStr = type === "movie" ? data.release_date : data.first_air_date;
+          if (dateStr) year = dateStr.slice(0, 4);
         }
-
-        log("SEARCH '" + query + "' → " + results.length + " results");
-        return uniq(results);
-    }).catch(function (e) {
-        log("SEARCH ERROR: " + (e && e.message));
-        return [];
+      }).catch(function(e) {
+        console.log("[QDrama] TMDB fetch failed (" + lang + "):", e && e.message);
+      });
     });
+  }, Promise.resolve()).then(function() {
+    if (!titles.length) throw new Error("Could not get TMDB titles for " + tmdbId);
+    console.log("[QDrama] TMDB titles:", titles.join(" | "));
+    return { titles: titles, year: year };
+  });
 }
 
-// ─────────────────────────────────────────────────────────────
-// SEARCH QUERY BUILDER
-// ─────────────────────────────────────────────────────────────
-function buildSearchQueries(titles, year, type, season, episode) {
-    var queries = [];
+function searchQDrama(title) {
+  var cleanTitle = String(title || "").replace(/[:\u060C-\u061F]/g, " ").replace(/\s+/g, " ").trim();
+  var url = BASE + "/search.php?keywords=" + encodeURIComponent(cleanTitle) + "&video-id=";
+  console.log("[QDrama] Search:", cleanTitle);
+  return fetchText(url, BASE + "/").then(function(html) {
+    var results = [];
     var seen = {};
-
-    function push(q) {
-        q = String(q || "").trim();
-        if (!q || seen[q]) return;
-        seen[q] = true;
-        queries.push(q);
-    }
-
-    titles.forEach(function (title) {
-        if (!title) return;
-        var isAr = hasArabic(title);
-
-        push(title);
-        if (year) push(title + " " + year);
-
-        if (isAr) {
-            push(title.replace(/^(فيلم|مسلسل|مسلسلة)\s+/i, ""));
-            if (type === "movie" && !/^فيلم/.test(title)) push("فيلم " + title);
-            if (type === "tv" && !/^مسلسل/.test(title)) push("مسلسل " + title);
-        }
-
-        if (type === "tv") {
-            var s = parseInt(season, 10) || 1;
-            var e = parseInt(episode, 10) || 1;
-            push(title + " الحلقة " + e);
-            push(title + " الموسم " + s + " الحلقة " + e);
-            push(title + " S" + pad2(s) + "E" + pad2(e));
-        }
-    });
-
-    return queries;
-}
-
-// ─────────────────────────────────────────────────────────────
-// BEST MATCH SCORING
-// ─────────────────────────────────────────────────────────────
-function pickBest(results, titles, year, type, season, episode) {
-    if (!results.length) return null;
-
-    var scored = results.map(function (r) {
-        var best = 0;
-        titles.forEach(function (t) {
-            if (!t) return;
-            var s = similarity(t, r.title);
-            if (s > best) best = s;
-        });
-
-        if (year && String(r.title).indexOf(String(year)) !== -1) best += 20;
-        if (type === "movie" && /فيلم|movie/i.test(r.title)) best += 5;
-        if (type === "tv" && /مسلسل|series|season/i.test(r.title)) best += 5;
-
-        if (type === "tv") {
-            var s = parseInt(season, 10) || 1;
-            var e = parseInt(episode, 10) || 1;
-            var t = normalizeTitle(r.title);
-
-            if (t.indexOf("الموسم " + s) !== -1 || t.indexOf("موسم " + s) !== -1) best += 30;
-            else if (s === 1 && t.indexOf("الموسم") === -1) best += 10;
-
-            var epPatterns = [
-                "الحلقة " + e, "الحلقه " + e,
-                "الحلقة " + pad2(e), "الحلقه " + pad2(e)
-            ];
-            var epFound = false;
-            epPatterns.forEach(function (p) {
-                if (t.indexOf(p) !== -1) epFound = true;
-            });
-            if (epFound) best += 50;
-
-            if (/كامل|جميع الحلقات/.test(t)) best -= 25;
-        }
-
-        return { result: r, score: best };
-    });
-
-    scored.sort(function (a, b) { return b.score - a.score; });
-    log("BEST: '" + scored[0].result.title + "' (score " + scored[0].score + " from " + scored.length + " candidates)");
-    return scored[0].score >= 25 ? scored[0].result : null;
-}
-
-// ─────────────────────────────────────────────────────────────
-// EPISODE LOOKUP VIA SEARCH
-// Q-Drama does NOT expose an episode list on watch pages.
-// The only reliable path is searching for the episode title.
-// ─────────────────────────────────────────────────────────────
-function findEpisodeViaSearch(baseTitle, season, episode) {
-    var e = parseInt(episode, 10) || 1;
-    var s = parseInt(season, 10) || 1;
-
-    var queries = [
-        baseTitle + " الحلقة " + e,
-        baseTitle + " الحلقه " + e,
-        baseTitle + " الموسم " + s + " الحلقة " + e
-    ];
-
-    var seen = {}, plan = [];
-    queries.forEach(function (q) { if (!seen[q]) { seen[q] = true; plan.push(q); } });
-
-    var chain = Promise.resolve(null);
-    plan.forEach(function (q) {
-        chain = chain.then(function (found) {
-            if (found) return found;
-            return searchQDrama(q).then(function (results) {
-                if (!results.length) return null;
-                for (var i = 0; i < results.length; i++) {
-                    var t = results[i].title;
-                    var norm = normalizeTitle(t);
-                    if (norm.indexOf("الحلقه " + e) !== -1 ||
-                        norm.indexOf("الحلقة " + e) !== -1) {
-                        log("EPISODE match: " + t);
-                        return results[i];
-                    }
-                }
-                return null;
-            });
-        });
-    });
-    return chain;
-}
-
-// ─────────────────────────────────────────────────────────────
-// EXTRACT VIDEO SOURCES FROM EMBED PAGE
-// ─────────────────────────────────────────────────────────────
-function collectStreams(text, base) {
-    var streams = [];
-    var m, re;
-
-    (text.match(/https?:\/\/[^\s"'<>\\()\[\]]+?\.m3u8[^\s"'<>\\()\[\],]*/gi) || []).forEach(function (u) {
-        streams.push(u);
-    });
-
-    re = /(?:file|src|source|url|hls\w*|stream\w*)["']?\s*[:=]\s*["']((?:\.{0,2}\/)?[^"'\s]+?\.m3u8[^"'\s]*)["']/gi;
-    while ((m = re.exec(text))) {
-        streams.push(absUrl(base, m[1]));
-    }
-
-    (text.match(/https?:\/\/[^\s"'<>\\()\[\]]+?\.mp4[^\s"'<>\\()\[\],]*/gi) || []).forEach(function (u) {
-        streams.push(u);
-    });
-
-    re = /(?:file|src|source|url)["']?\s*[:=]\s*["']((?:\.{0,2}\/)?[^"'\s]+?\.mp4[^"'\s]*)["']/gi;
-    while ((m = re.exec(text))) {
-        streams.push(absUrl(base, m[1]));
-    }
-
-    re = /sources\s*:\s*\[\s*\{[^}]*?file\s*:\s*["']([^"']+)["']/gi;
-    while ((m = re.exec(text))) {
-        streams.push(absUrl(base, m[1]));
-    }
-
-    re = /["']?file["']?\s*:\s*["']([^"']+\.(?:mp4|m3u8)[^"']*)["']/gi;
-    while ((m = re.exec(text))) {
-        streams.push(absUrl(base, m[1]));
-    }
-
-    return uniq(streams);
-}
-
-function collectSubtitles(text, base) {
-    var subs = [];
-    var m, re;
-
-    re = /\{[^{}]*?["']?(?:file|src|url)["']?\s*:\s*["']([^"']+\.(?:vtt|srt)[^"']*)["'][^{}]*\}/gi;
-    while ((m = re.exec(text))) {
-        var lb = /["']?(?:label|language|lang|name|srclang)["']?\s*:\s*["']([^"']+)["']/i.exec(m[0]);
-        subs.push({ url: absUrl(base, m[1]), lang: lb ? lb[1] : "Subtitle" });
-    }
-
-    (text.match(/https?:\/\/[^\s"'<>\\()\[\]]+?\.(?:vtt|srt)[^\s"'<>\\()\[\],]*/gi) || []).forEach(function (u) {
-        subs.push({ url: u, lang: "Subtitle" });
-    });
-
-    return uniq(subs);
-}
-
-function extractFromServer(serverUrl, referer) {
-    log("EXTRACT: " + serverUrl);
-
-    return request(serverUrl, {
-        "User-Agent": UA,
-        "Referer": referer,
-        "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
-        "Accept-Language": "ar,en-US;q=0.7,en;q=0.3"
-    }).then(function (r) {
-        var html = r.text;
-
-        var variants = [html];
-        var packed = unpackAll(html);
-        variants = variants.concat(packed);
-
-        var b64Matches = html.match(/atob\(\s*["']([A-Za-z0-9+\/=_\-]{20,})["']\s*\)/g) || [];
-        b64Matches.forEach(function (m) {
-            var b64 = /atob\(\s*["']([A-Za-z0-9+\/=_\-]{20,})["']\s*\)/.exec(m);
-            if (b64) {
-                try {
-                    var decoded = b64decode(b64[1]);
-                    variants.push(decoded);
-                    variants = variants.concat(unpackAll(decoded));
-                } catch (e) { /* skip */ }
-            }
-        });
-
-        var allStreams = [];
-        var allSubs = [];
-        variants.forEach(function (v) {
-            var normalized = v.replace(/\\\//g, "/").replace(/\\u0026/gi, "&").replace(/&amp;/g, "&");
-            allStreams = allStreams.concat(collectStreams(normalized, serverUrl));
-            allSubs = allSubs.concat(collectSubtitles(normalized, serverUrl));
-        });
-
-        // Server-specific: Vidmoly
-        if (serverUrl.indexOf("vidmoly") !== -1) {
-            var vm = /sources\s*:\s*\[\s*\{[^}]*?file\s*:\s*["']([^"']+)["']/i.exec(html);
-            if (vm) allStreams.push(vm[1]);
-        }
-
-        // Server-specific: Uqload
-        if (serverUrl.indexOf("uqload") !== -1) {
-            var uq = /sources\s*:\s*\[\s*\{[^}]*?file\s*:\s*["']([^"']+)["']/i.exec(html);
-            if (uq) allStreams.push(uq[1]);
-        }
-
-        // Server-specific: OK.ru
-        if (serverUrl.indexOf("ok.ru") !== -1) {
-            var ok = /["']?(?:url|videoSrc)["']?\s*:\s*["']([^"']+\.(?:mp4|m3u8)[^"']*)["']/gi;
-            var okm;
-            while ((okm = ok.exec(html))) allStreams.push(okm[1]);
-        }
-
-        // Server-specific: abyssplayer
-        if (serverUrl.indexOf("abyssplayer") !== -1) {
-            var ab = /["']?file["']?\s*:\s*["']([^"']+\.(?:mp4|m3u8)[^"']*)["']/gi;
-            var abm;
-            while ((abm = ab.exec(html))) allStreams.push(abm[1]);
-        }
-
-        allStreams = uniq(allStreams);
-        log("EXTRACT " + serverUrl.split("/")[2] + " → " + allStreams.length + " streams");
-        return { streams: allStreams, subs: uniq(allSubs) };
-    }).catch(function (e) {
-        log("EXTRACT failed: " + (e && e.message));
-        return { streams: [], subs: [] };
-    });
-}
-
-// ─────────────────────────────────────────────────────────────
-// PARSE EMBED SERVERS FROM embed.php
-// ─────────────────────────────────────────────────────────────
-function parseEmbedServers(html) {
-    var servers = [];
+    var re = /<a[^>]*href=["']([^"']*\/watch\.php\?vid=([^"'&]+))["'][^>]*title=["']([^"']+)["'][^>]*>/gi;
     var m;
-
-    var re = /<option\s+value="([^"]+)"[^>]*>\s*([^<]+)\s*<\/option>/gi;
-    while ((m = re.exec(html))) {
-        var name = stripHtml(m[2]).trim();
-        var url = m[1].replace(/&amp;/g, "&");
-        if (/^https?:\/\//i.test(url)) {
-            servers.push({ name: name, url: url });
-        }
+    while ((m = re.exec(html)) !== null) {
+      var fullUrl = decodeHtml(m[1]);
+      var vid = m[2];
+      var linkTitle = decodeHtml(m[3]);
+      if (seen[vid]) continue;
+      seen[vid] = 1;
+      var absolute = fullUrl.indexOf("http") === 0 ? fullUrl : BASE + fullUrl;
+      results.push({ url: absolute, title: linkTitle, vid: vid });
     }
-
-    if (!servers.length) {
-        re = /<iframe[^>]+src="([^"]+)"/i;
-        m = re.exec(html);
-        if (m) {
-            servers.push({ name: "Default", url: m[1] });
-        }
+    if (!results.length) {
+      var re2 = /<a[^>]*href=["']([^"']*\/watch\.php\?vid=([^"'&]+))["'][^>]*>/gi;
+      while ((m = re2.exec(html)) !== null) {
+        var fullUrl2 = decodeHtml(m[1]);
+        var vid2 = m[2];
+        if (seen[vid2]) continue;
+        seen[vid2] = 1;
+        var absolute2 = fullUrl2.indexOf("http") === 0 ? fullUrl2 : BASE + fullUrl2;
+        results.push({ url: absolute2, title: vid2, vid: vid2 });
+      }
     }
-
-    log("Found " + servers.length + " servers");
-    return servers;
+    console.log("[QDrama] Search results:", results.length);
+    return results;
+  });
 }
 
-// ─────────────────────────────────────────────────────────────
-// DETECT QUALITY FROM URL
-// ─────────────────────────────────────────────────────────────
-function detectQuality(url) {
-    var m = /(\d{3,4})p?/i.exec(url);
-    if (m) return parseInt(m[1], 10);
-    if (/1080/i.test(url)) return 1080;
-    if (/720/i.test(url)) return 720;
-    if (/480/i.test(url)) return 480;
-    return 0;
+function chooseResult(results, titles, year, isTv) {
+  var best = null;
+  var bestScore = 0;
+  results.forEach(function(r) {
+    var s = scoreResult(r, titles, year, isTv);
+    if (s > bestScore) { bestScore = s; best = r; }
+  });
+  if (best) console.log("[QDrama] Best:", best.title, "score:", bestScore.toFixed(3));
+  return bestScore >= 0.3 ? best : null;
 }
 
-// ─────────────────────────────────────────────────────────────
-// CORE: GET STREAMS
-// ─────────────────────────────────────────────────────────────
-function getStreamsFor(tmdbId, type, season, episode, titles, year) {
-    var displayTitle = (titles[0] || ("TMDB " + tmdbId)) +
-        (type === "tv" ? " S" + pad2(season) + "E" + pad2(episode) : "");
+function buildEmbedUrl(vid) {
+  return BASE + "/embed.php?vid=" + vid;
+}
 
-    var queries = buildSearchQueries(titles, year, type, season, episode);
-    log("Query plan: " + queries.slice(0, 6).join(" | "));
+/* ---------- mirror discovery ---------- */
 
-    var chain = Promise.resolve([]);
-    queries.slice(0, 6).forEach(function (q) {
-        chain = chain.then(function (acc) {
-            return searchQDrama(q).then(function (r) { return acc.concat(r); });
+function hostLabel(host) {
+  var parts = String(host).replace(/^www\./, "").split(".");
+  var name = parts.length > 1 ? parts[parts.length - 2] : parts[0];
+  return name.charAt(0).toUpperCase() + name.slice(1);
+}
+
+function rawMirror(raw) {
+  var u = cleanEscapes(raw).trim();
+  if (u.indexOf("//") === 0) u = "https:" + u;
+  var m = u.match(/^https?:\/\/([^\/?#:]+)/i);
+  if (!m || BAD_HOST.test(m[1])) return null;
+  return { embed: u, host: m[1].toLowerCase(), label: hostLabel(m[1]) };
+}
+
+function normalizeMirror(raw) {
+  var u = cleanEscapes(raw).trim();
+  if (u.indexOf("//") === 0) u = "https:" + u;
+  var m = u.match(/^(https?:\/\/)([^\/?#:]+)(?::\d+)?(\/[^?#]*)?(\?[^#]*)?/i);
+  if (!m) return null;
+  var host = m[2].toLowerCase();
+  if (BAD_HOST.test(host)) return null;
+  var origin = m[1].toLowerCase() + host;
+  var path = m[3] || "/";
+  var query = m[4] || "";
+  var id = null, embed = null, mm;
+
+  if ((mm = path.match(/^\/embed-([a-z0-9]{8,20})(?:\.html)?$/i))) {
+    id = mm[1]; embed = origin + "/embed-" + id + ".html";
+  } else if ((mm = path.match(/^\/(?:d|dl)\/([a-z0-9]{8,20})(?:_[a-z])?\/?$/i))) {
+    id = mm[1]; embed = origin + "/embed-" + id + ".html";
+  } else if (/^\/dl\/?$/i.test(path) && (mm = query.match(/[?&]id=([a-z0-9]{8,20})/i))) {
+    id = mm[1]; embed = origin + "/embed-" + id + ".html";
+  } else if ((mm = path.match(/^\/download\/([a-z0-9]{8,20})\/?$/i))) {
+    id = mm[1]; embed = origin + "/e/" + id;
+  } else if ((mm = path.match(/^\/(?:e|embed)\/([a-z0-9]{8,20})\/?$/i))) {
+    id = mm[1]; embed = origin + path;
+  } else {
+    return null;
+  }
+  return { embed: embed, host: host, id: id, label: hostLabel(host) };
+}
+
+function collectUrls(text, out) {
+  var re = /(?:https?:)?\/\/[a-z0-9][a-z0-9.\-]*\.[a-z]{2,}(?::\d+)?\/[^\s"'<>\\)\]]*/gi;
+  var m;
+  while ((m = re.exec(text)) !== null) out.push(m[0]);
+}
+
+function b64decode(s) {
+  try {
+    if (typeof atob === "function") return atob(s);
+    if (typeof Buffer !== "undefined") return Buffer.from(s, "base64").toString("binary");
+  } catch (e) {}
+  return "";
+}
+
+function harvestMirrors(html) {
+  var out = [];
+  var seen = {};
+  function add(mir) {
+    if (!mir) return;
+    var k = mir.embed.toLowerCase();
+    if (seen[k]) return;
+    seen[k] = 1;
+    out.push(mir);
+  }
+  var text = cleanEscapes(html);
+  var m;
+
+  // QDrama-specific: <option value="URL"> in the server dropdown
+  var reOpt = /<option[^>]+value=["']([^"']+)["'][^>]*>/gi;
+  while ((m = reOpt.exec(text)) !== null) {
+    if (m[1].indexOf("http") !== 0) continue;
+    add(rawMirror(m[1]) || normalizeMirror(m[1]));
+  }
+
+  var reIf = /<iframe[^>]+src=["']([^"']+)["']/gi;
+  while ((m = reIf.exec(text)) !== null) {
+    add(normalizeMirror(m[1]) || rawMirror(m[1]));
+  }
+
+  var urls = [];
+  collectUrls(text, urls);
+
+  var reB64 = /["']([A-Za-z0-9+\/]{24,}={0,2})["']/g;
+  while ((m = reB64.exec(text)) !== null) {
+    var dec = b64decode(m[1]);
+    if (dec && dec.indexOf("//") !== -1) collectUrls(cleanEscapes(dec), urls);
+  }
+
+  urls.forEach(function(u) { add(normalizeMirror(u)); });
+
+  console.log("[QDrama] harvest: options=" + (text.match(/<option/gi) || []).length +
+              " iframes=" + (text.match(/<iframe/gi) || []).length +
+              " urls=" + urls.length +
+              " mirrors=" + out.length);
+  return out;
+}
+
+/* ---------- player extraction ---------- */
+
+function packerEncode(c, a) {
+  return (c < a ? "" : packerEncode(parseInt(c / a, 10), a)) +
+    ((c = c % a) > 35 ? String.fromCharCode(c + 29) : c.toString(36));
+}
+
+function unpackEval(html) {
+  var m = html.match(/eval\(function\(p,a,c,k,e,[dr]\)\{[\s\S]*?\}\('([\s\S]*?)',(\d+),(\d+),'([\s\S]*?)'\.split\('\|'\)/);
+  if (!m) return null;
+  try {
+    var payload = m[1].replace(/\\'/g, "'").replace(/\\\\/g, "\\");
+    var base = parseInt(m[2], 10);
+    var count = parseInt(m[3], 10);
+    var keywords = m[4].split("|");
+    var dict = {};
+    while (count--) {
+      var key = packerEncode(count, base);
+      dict[key] = keywords[count] || key;
+    }
+    return payload.replace(/\b\w+\b/g, function(w) {
+      return dict.hasOwnProperty(w) ? dict[w] : w;
+    });
+  } catch (e) {
+    return null;
+  }
+}
+
+function extractStreamsFromPlayer(playerHtml) {
+  var streams = [];
+  var seen = {};
+  var unpacked = unpackEval(playerHtml);
+  var search = cleanEscapes(unpacked || playerHtml);
+  console.log("[QDrama] unpacked:", unpacked ? "yes (" + search.length + " chars)" : "no");
+
+  var re = /https?:\/\/[^"'\s<>\\]+\.(?:m3u8|mp4)[^"'\s<>\\]*/gi;
+  var m;
+  while ((m = re.exec(search)) !== null) {
+    var u = m[0];
+    if (seen[u]) continue;
+    seen[u] = 1;
+    streams.push(u);
+  }
+
+  var re2 = /(?:file|source|src|url)\s*[:=]\s*["']([^"']+\.(?:m3u8|mp4)[^"']*)["']/gi;
+  while ((m = re2.exec(search)) !== null) {
+    var u2 = m[1];
+    if (u2.indexOf("http") !== 0) continue;
+    if (seen[u2]) continue;
+    seen[u2] = 1;
+    streams.push(u2);
+  }
+
+  console.log("[QDrama] m3u8/mp4 found:", streams.length);
+  if (!streams.length) {
+    var packed = /eval\(function\(p,a,c,k,e,/i.test(playerHtml);
+    var hasM3u8Ref = /\.m3u8/i.test(playerHtml);
+    var hasMp4Ref  = /\.mp4/i.test(playerHtml);
+    console.log("[QDrama] extract: 0 streams | packed=" + packed +
+                " m3u8ref=" + hasM3u8Ref + " mp4ref=" + hasMp4Ref +
+                " bodyLen=" + playerHtml.length);
+  }
+  return streams;
+}
+
+function qualityFromUrl(url) {
+  var s = String(url).toLowerCase();
+  if (/2160|4k/.test(s)) return "4K";
+  if (/1440/.test(s)) return "1440p";
+  if (/1080/.test(s)) return "1080p";
+  if (/720/.test(s)) return "720p";
+  if (/480/.test(s)) return "480p";
+  if (/360/.test(s)) return "360p";
+  return "Unknown";
+}
+
+function makeStream(url, label, playerUrl) {
+  var origin = originOf(playerUrl);
+  var streamReferer = origin + "/";
+
+  if (url.indexOf("http://") === 0) {
+    url = "https://" + url.slice(7);
+  }
+
+  return {
+    name: "🎖️ QDrama",
+    title: label ? "🎖️ QDrama \u2022 " + label : "🌀 QDrama",
+    url: url,
+    quality: qualityFromUrl(url),
+    referer: streamReferer,
+    headers: {
+      "User-Agent": UA,
+      "Referer": streamReferer,
+      "Origin": origin,
+      "Accept": "*/*"
+    }
+  };
+}
+
+function resolveMirror(mir, referer) {
+  return fetchText(mir.embed, referer).then(function(html) {
+    var urls = extractStreamsFromPlayer(html);
+    console.log("[QDrama]", mir.label, "streams:", urls.length);
+    var streams = urls.map(function(u, i) {
+      return makeStream(u, mir.label + (urls.length > 1 ? " #" + (i + 1) : ""), mir.embed);
+    });
+    return { mirror: mir, streams: streams };
+  }).catch(function(err) {
+    console.log("[QDrama]", mir.label, "failed:", err.message);
+    return { mirror: mir, streams: [] };
+  });
+}
+
+function resolveVid(vid) {
+  var embedUrl = buildEmbedUrl(vid);
+  var pages = [
+    embedUrl,
+    BASE + "/watch.php?vid=" + vid
+  ];
+  console.log("[QDrama] embed:", embedUrl);
+
+  return Promise.all(pages.map(function(p) {
+    return fetchText(p, BASE + "/").catch(function(err) {
+      console.log("[QDrama] page failed:", p, err.message);
+      return "";
+    });
+  })).then(function(htmls) {
+    var mirrors = [];
+    var seen = {};
+    htmls.forEach(function(h) {
+      harvestMirrors(h).forEach(function(mir) {
+        var k = mir.embed.toLowerCase();
+        if (seen[k]) return;
+        seen[k] = 1;
+        mirrors.push(mir);
+      });
+    });
+    console.log("[QDrama] mirrors found:", mirrors.length, "->", mirrors.map(function(x) { return x.label; }).join(", "));
+    if (!mirrors.length) return [];
+
+    return Promise.all(mirrors.map(function(mir) {
+      return withTimeout(resolveMirror(mir, embedUrl), MIRROR_TIMEOUT, { mirror: mir, streams: [] });
+    })).then(function(results) {
+      var out = [];
+      var seenUrl = {};
+      results.forEach(function(r) {
+        r.streams.forEach(function(s) {
+          if (seenUrl[s.url]) return;
+          seenUrl[s.url] = 1;
+          out.push(s);
         });
+      });
+      if (out.length) return out;
+      console.log("[QDrama] No direct URL — returning embed fallback");
+      return results.slice(0, 3).map(function(r) {
+        return {
+          name: "🎖️ QDrama",
+          title: "🎖️ QDrama (Embed) \u2022 " + r.mirror.label,
+          url: r.mirror.embed,
+          quality: "Auto",
+          type: "iframe",
+          referer: embedUrl
+        };
+      });
     });
+  });
+}
 
-    return chain.then(function (allResults) {
-        var unique = uniq(allResults);
-        log("Total unique: " + unique.length);
-        var best = pickBest(unique, titles, year, type, season, episode);
-        if (!best) { log("No confident match"); return []; }
-
-        if (type === "tv") {
-            var baseTitle = (titles[0] || best.title).replace(/^(مسلسل|فيلم)\s+/i, "").trim();
-            return findEpisodeViaSearch(baseTitle, season, episode).then(function (ep) {
-                if (ep) { log("Using episode page: " + ep.url); return ep.url; }
-                log("Episode search failed, falling back to best: " + best.url);
-                return best.url;
-            });
-        }
-        return best.url;
-    }).then(function (playUrl) {
-        if (!playUrl) return [];
-        log("PLAY: " + playUrl);
-
-        var vidMatch = /vid=([A-Za-z0-9]+)/i.exec(playUrl);
-        if (!vidMatch) { log("No vid in URL"); return []; }
-        var vid = vidMatch[1];
-
-        var embedUrl = BASE_URL + "/embed.php?vid=" + vid;
-        return Promise.all([
-            getPage(embedUrl, playUrl).catch(function (e) { log("embed fetch fail: " + e.message); return { text: "" }; }),
-            getPage(playUrl, BASE_URL + "/").catch(function (e) { log("watch fetch fail: " + e.message); return { text: "" }; })
-        ]).then(function (pages) {
-            var servers = parseEmbedServers(pages[0].text);
-            log("Servers from embed.php: " + servers.length);
-
-            if (!servers.length) {
-                var cm = /<meta\s+itemprop="contentUrl"\s+content="([^"]+)"/i.exec(pages[1].text);
-                if (cm && /^https?:\/\//i.test(cm[1])) {
-                    servers.push({ name: "سيرفر 1", url: cm[1] });
-                    log("Fallback server: " + cm[1]);
-                }
-            }
-
-            if (!servers.length) { log("No servers at all"); return []; }
-
-            return Promise.all(servers.map(function (srv) {
-                return extractFromServer(srv.url, playUrl).then(function (res) {
-                    return { server: srv.name, streams: res.streams, subs: res.subs };
-                });
-            })).then(function (groups) {
-                var seen = {}, out = [], allSubs = [];
-                groups.forEach(function (g) {
-                    allSubs = allSubs.concat(g.subs);
-                    g.streams.forEach(function (url) {
-                        if (seen[url]) return;
-                        seen[url] = true;
-                        out.push({
-                            url: url, server: g.server,
-                            quality: detectQuality(url),
-                            type: /\.m3u8/i.test(url) ? "hls" : "mp4"
-                        });
-                    });
-                });
-                out.sort(function (a, b) { return b.quality - a.quality; });
-                allSubs = uniq(allSubs);
-                log("TOTAL: " + out.length + " streams, " + allSubs.length + " subs");
-
-                return out.map(function (s) {
-                    return {
-                        name: PROVIDER_NAME + " - " + s.server + " (" + s.type.toUpperCase() + ")",
-                        title: displayTitle + " • " + s.server,
-                        url: s.url,
-                        quality: s.quality >= 1080 ? "1080p" : s.quality >= 720 ? "720p"
-                               : s.quality >= 480 ? "480p" : "Auto",
-                        size: "Unknown",
-                        type: s.type,
-                        headers: {
-                            "User-Agent": UA,
-                            "Referer": playUrl,
-                            "Origin": BASE_URL
-                        },
-                        provider: PROVIDER_ID,
-                        subtitles: allSubs
-                    };
-                });
-            });
+function getMovieStreams(tmdbId) {
+  return getTmdbTitles(tmdbId, "movie").then(function(meta) {
+    return Promise.all(meta.titles.map(function(t) {
+      return searchQDrama(t).catch(function() { return []; });
+    })).then(function(groups) {
+      var all = [];
+      var seen = {};
+      groups.forEach(function(g) {
+        g.forEach(function(r) {
+          if (!seen[r.vid]) { seen[r.vid] = 1; all.push(r); }
         });
-    }).catch(function (err) {
-        log("FAILED: " + (err && err.stack || err && err.message || err));
-        return [];
+      });
+      console.log("[QDrama] Unique movie candidates:", all.length);
+      if (!all.length) return [];
+      var best = chooseResult(all, meta.titles, meta.year, false);
+      if (!best) return [];
+      return resolveVid(best.vid);
     });
+  }).catch(function(err) {
+    console.log("[QDrama] Movie error:", err.message);
+    return [];
+  });
 }
 
-// ─────────────────────────────────────────────────────────────
-// ENTRY POINT
-// ─────────────────────────────────────────────────────────────
-function getStreams(tmdbId, mediaType, seasonNum, episodeNum, meta) {
-    var type = (mediaType === "tv" || mediaType === "series") ? "tv" : "movie";
-    var season = parseInt(seasonNum, 10) || 1;
-    var episode = parseInt(episodeNum, 10) || 1;
-
-    meta = meta || {};
-    var titles = [];
-    [meta.title, meta.name, meta.original_title, meta.original_name, meta.originalTitle]
-        .forEach(function (t) { if (t && titles.indexOf(t) === -1) titles.push(t); });
-    (meta.aliases || meta.alternativeTitles || []).forEach(function (t) {
-        if (t && titles.indexOf(t) === -1) titles.push(t);
+function getTvStreams(tmdbId, season, episode) {
+  var wanted = Number(episode) || 1;
+  return getTmdbTitles(tmdbId, "tv").then(function(meta) {
+    var searches = [];
+    meta.titles.forEach(function(t) {
+      searches.push(t + " الحلقة " + wanted);
+      searches.push(t + " " + wanted);
+      searches.push(t);
     });
 
-    var year = meta.year || meta.releaseYear || null;
+    return Promise.all(searches.map(function(q) {
+      return searchQDrama(q).catch(function() { return []; });
+    })).then(function(groups) {
+      var all = [];
+      var seen = {};
+      groups.forEach(function(g) {
+        g.forEach(function(r) {
+          if (!seen[r.vid]) { seen[r.vid] = 1; all.push(r); }
+        });
+      });
+      console.log("[QDrama] Unique TV candidates:", all.length);
 
-    log("getStreams: " + tmdbId + " " + type +
-        (type === "tv" ? " S" + season + "E" + episode : "") +
-        " | titles=" + JSON.stringify(titles) + " | year=" + year);
+      var withEp = all.filter(function(r) {
+        var dec = r.title;
+        return new RegExp("(?:الحلق[ةه]\\s*" + wanted + "\\b|\\b" + wanted + "\\b)", "i").test(dec);
+      });
+      var pool = withEp.length ? withEp : all;
+      console.log("[QDrama] TV candidates with ep " + wanted + ":", withEp.length, "/ pool:", pool.length);
 
-    if (!titles.length) {
-        log("No titles — aborting. Nuvio must pass meta.title.");
-        return Promise.resolve([]);
-    }
-
-    return getStreamsFor(String(tmdbId || ""), type, season, episode, titles, year);
+      if (!pool.length) return [];
+      var best = chooseResult(pool, meta.titles, null, true);
+      if (!best) return [];
+      return resolveVid(best.vid);
+    });
+  }).catch(function(err) {
+    console.log("[QDrama] TV error:", err.message);
+    return [];
+  });
 }
 
-if (typeof module !== "undefined" && module.exports) module.exports = { getStreams: getStreams };
-if (typeof global !== "undefined") global.getStreams = getStreams;
+function getStreams(tmdbId, mediaType, season, episode) {
+  console.log("[QDrama] getStreams:", tmdbId, mediaType, season, episode);
+  if (mediaType === "tv") return getTvStreams(tmdbId, season, episode);
+  return getMovieStreams(tmdbId);
+}
+
+module.exports = {
+  getStreams: getStreams
+};
