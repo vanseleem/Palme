@@ -263,14 +263,10 @@ function harvestMirrors(html) {
   var text = cleanEscapes(html);
   var m;
 
-  var reServers = /var\s+servers\s*=\s*\[([\s\S]*?)\];/i;
-  var srvMatch = reServers.exec(text);
-  if (srvMatch) {
-    var srvText = srvMatch[1];
-    var reIfSrc = /src=\\?"([^"\\]+)\\?"/gi;
-    while ((m = reIfSrc.exec(srvText)) !== null) {
-      add(rawMirror(m[1]) || normalizeMirror(m[1]));
-    }
+  var reOpt = /<option[^>]+value=["']([^"']+)["'][^>]*>/gi;
+  while ((m = reOpt.exec(text)) !== null) {
+    if (m[1].indexOf("http") !== 0) continue;
+    add(rawMirror(m[1]) || normalizeMirror(m[1]));
   }
 
   var reIf = /<iframe[^>]+src=["']([^"']+)["']/gi;
@@ -411,10 +407,9 @@ function resolveMirror(mir, referer) {
 
 function resolveVid(vid) {
   var embedUrl = buildEmbedUrl(vid);
-  var playUrl = BASE + "/play.php?vid=" + vid;
-  console.log("[QDrama] play:", playUrl);
+  console.log("[QDrama] embed:", embedUrl);
 
-  return fetchText(playUrl, BASE + "/").then(function(html) {
+  return fetchText(embedUrl, BASE + "/").then(function(html) {
     var mirrors = harvestMirrors(html);
     console.log("[QDrama] mirrors found:", mirrors.length, "->", mirrors.map(function(x) { return x.label; }).join(", "));
     if (!mirrors.length) return [];
@@ -422,7 +417,7 @@ function resolveVid(vid) {
     mirrors = mirrors.slice(0, MAX_SERVERS);
 
     return Promise.all(mirrors.map(function(mir) {
-      return withTimeout(resolveMirror(mir, playUrl), MIRROR_TIMEOUT, { mirror: mir, streams: [] });
+      return withTimeout(resolveMirror(mir, embedUrl), MIRROR_TIMEOUT, { mirror: mir, streams: [] });
     })).then(function(results) {
       var streams = [];
       var seenHosts = {};
@@ -450,13 +445,13 @@ function resolveVid(vid) {
           url: r.mirror.embed,
           quality: "Auto",
           type: "iframe",
-          referer: playUrl
+          referer: embedUrl
         });
       });
       return fallbacks.slice(0, MAX_SERVERS);
     });
   }).catch(function(err) {
-    console.log("[QDrama] play.php failed:", err.message);
+    console.log("[QDrama] embed.php failed:", err.message);
     return [];
   });
 }
