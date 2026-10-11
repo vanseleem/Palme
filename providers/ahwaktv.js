@@ -15,6 +15,13 @@ var MAX_QUERIES = 10;
 var SITE_TIMEOUT = 15000;
 var EMBED_TIMEOUT = 12000;
 
+// Speed settings for the series search (matching logic is NOT affected by any of these).
+var SEARCH_TIMEOUT = 9000;        // one search page; a normal page answers in well under 2s
+var HUB_TIMEOUT = 8000;           // one series-hub guess
+var SEARCH_CONCURRENCY = 6;       // search pages fetched at the same time
+var SEARCH_BUDGET_MS = 14000;     // stop paging the site after this long and use what was found
+var EARLY_STOP_UNNUMBERED_S1 = false; // true = also stop early on season-1 titles with no season label (faster, slightly different pick order)
+
 var UA_SITE = 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Mobile Safari/537.36';
 var UA_EMBED = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
@@ -272,13 +279,76 @@ function fetchText(url, headers, timeoutMs) {
     });
 }
 
-function siteGet(url, referer) {
+function siteGet(url, referer, timeoutMs) {
   return fetchText(url, {
     'User-Agent': UA_SITE,
     'Referer': referer || BASE_URL + '/',
     'Accept': 'text/html,application/xhtml+xml',
     'Accept-Language': 'ar,en;q=0.9'
-  }, SITE_TIMEOUT);
+  }, timeoutMs || SITE_TIMEOUT);
+}
+
+function noop() {}
+
+function delay(ms) {
+  if (typeof setTimeout !== 'function') return Promise.resolve();
+  return new Promise(function (resolve) { setTimeout(resolve, ms); });
+}
+
+// One retry for a failed (non-timeout) request, so a single hiccup cannot drop a search page.
+function siteGetRetry(url, timeoutMs) {
+  function attempt(n) {
+    return siteGet(url, null, timeoutMs).catch(function (err) {
+      if (n >= 1 || /^timeout/.test(String(err && err.message))) throw err;
+      return delay(250).then(function () { return attempt(n + 1); });
+    });
+  }
+  return attempt(0);
+}
+
+// Runs jobs with a concurrency limit. The job with the lowest key always starts first,
+// so the requests the search needs soonest are never queued behind later ones.
+function createPool(limit) {
+  var active = 0;
+  var queue = [];
+  var closed = false;
+
+  function start(job) {
+    var p;
+    try { p = Promise.resolve(job.run()); } catch (e) { p = Promise.reject(e); }
+    p.then(
+      function (v) { active--; job.resolve(v); pump(); },
+      function (e) { active--; job.reject(e); pump(); }
+    );
+  }
+
+  function pump() {
+    while (!closed && active < limit && queue.length) {
+      var best = 0;
+      for (var i = 1; i < queue.length; i++) {
+        if (queue[i].key < queue[best].key) best = i;
+      }
+      var job = queue.splice(best, 1)[0];
+      active++;
+      start(job);
+    }
+  }
+
+  return {
+    add: function (key, run) {
+      if (closed) return Promise.reject(new Error('cancelled'));
+      return new Promise(function (resolve, reject) {
+        queue.push({ key: key, run: run, resolve: resolve, reject: reject });
+        pump();
+      });
+    },
+    close: function () {
+      closed = true;
+      var pending = queue;
+      queue = [];
+      pending.forEach(function (j) { j.reject(new Error('cancelled')); });
+    }
+  };
 }
 
 function hostOf(url) {
@@ -486,10 +556,10 @@ function strictTitleMatch(parsedName, targets) {
   return { matched: false };
 }
 
-function searchPage(query, page) {
+function searchPage(query, page, fast) {
   var url = BASE_URL + '/search.php?keywords=' + encodeURIComponent(query) +
     (page > 1 ? '&page=' + page : '');
-  return siteGet(url).then(function (html) {
+  return (fast ? siteGetRetry(url, SEARCH_TIMEOUT) : siteGet(url)).then(function (html) {
     return {
       entries: parseWatchAnchors(html).filter(function (a) { return a.title; }),
       maxPage: parseMaxPage(html)
@@ -497,10 +567,12 @@ function searchPage(query, page) {
   });
 }
 
-function searchPages(query, onEntries) {
+function searchPages(query, onEntries, session, qi) {
   var page = 1;
   function step() {
-    return searchPage(query, page).then(function (res) {
+    if (session && session.expired()) return Promise.resolve(false);
+    var request = session ? session.page(qi, page) : searchPage(query, page);
+    return request.then(function (res) {
       if (onEntries(res.entries)) return true;
       if (page >= MAX_SEARCH_PAGES || page >= res.maxPage) return false;
       page += 1;
@@ -513,16 +585,49 @@ function searchPages(query, onEntries) {
   return step();
 }
 
-function searchQueries(queries, onEntries, afterQuery) {
+function searchQueries(queries, onEntries, afterQuery, session) {
   var qi = 0;
   function nextQuery() {
     if (qi >= queries.length) return Promise.resolve(false);
-    return searchPages(queries[qi++], onEntries).then(function (stop) {
+    if (session && session.expired()) return Promise.resolve(false);
+    var idx = qi++;
+    return searchPages(queries[idx], onEntries, session, idx).then(function (stop) {
       if (stop || (afterQuery && afterQuery())) return true;
       return nextQuery();
     });
   }
   return nextQuery();
+}
+
+// Series only: fetches the search pages ahead of the (unchanged) one-by-one reading below,
+// in the exact order they will be read, and drops whatever is still queued once reading stops.
+function createSearchSession(queries) {
+  var pool = createPool(SEARCH_CONCURRENCY);
+  var pages = {};
+  var startedAt = Date.now();
+
+  function request(qi, page) {
+    var key = qi + ':' + page;
+    if (pages[key]) return pages[key];
+    var p = pool.add(qi * 100 + page, function () { return searchPage(queries[qi], page, true); });
+    p.catch(noop);
+    pages[key] = p;
+    if (page === 1) {
+      p.then(function (res) {
+        var last = Math.min(MAX_SEARCH_PAGES, res.maxPage);
+        for (var n = 2; n <= last; n++) request(qi, n);
+      }, noop);
+    }
+    return p;
+  }
+
+  queries.forEach(function (q, qi) { request(qi, 1); });
+
+  return {
+    page: request,
+    expired: function () { return Date.now() - startedAt > SEARCH_BUDGET_MS; },
+    close: function () { pool.close(); }
+  };
 }
 
 function scoreMovieEntry(entry, meta) {
@@ -793,7 +898,7 @@ function hubUrls(meta) {
 
 function loadHubs(meta) {
   return Promise.all(hubUrls(meta).map(function (url) {
-    return siteGet(url).then(function (html) {
+    return siteGet(url, null, HUB_TIMEOUT).then(function (html) {
       if (!hubMatches(html, meta.targets)) return null;
       return { url: url, html: html, blocks: parseSeasonBlocks(html) };
     }).catch(function () { return null; });
@@ -803,6 +908,12 @@ function loadHubs(meta) {
 function findSeriesMatches(meta, season, episode) {
   var matched = [];
   var seen = {};
+
+  function isExplicit(info, hint) {
+    if (info.episode !== episode) return false;
+    if (hint === season) return true;
+    return EARLY_STOP_UNNUMBERED_S1 && season === 1 && hint == null;
+  }
 
   function onEntries(entries) {
     var haveExplicit = false;
@@ -816,15 +927,22 @@ function findSeriesMatches(meta, season, episode) {
       seen[entry.vid] = true;
       var hint = seasonHintOf(info, mm);
       matched.push({ vid: entry.vid, title: entry.title, info: info, seasonHint: hint });
-      if (info.episode === episode && hint === season) haveExplicit = true;
+      if (isExplicit(info, hint)) haveExplicit = true;
     });
     return haveExplicit;
   }
 
   var queries = buildQueries(meta.displayTitle, meta, 'tv', season, episode);
+  var session = createSearchSession(queries);
   return searchQueries(queries, onEntries, function () {
-    return matched.some(function (m) { return m.info.episode === episode && m.seasonHint === season; });
-  }).then(function () { return matched; });
+    return matched.some(function (m) { return isExplicit(m.info, m.seasonHint); });
+  }, session).then(function () {
+    session.close();
+    return matched;
+  }, function (err) {
+    session.close();
+    throw err;
+  });
 }
 
 function serieUrlFromWatch(html) {
@@ -846,10 +964,22 @@ function probeMatches(matches, meta, season, episode) {
   var slice = ordered.slice(0, 5);
   var i = 0;
   var seenHub = {};
+
+  // Watch pages are fetched together up front; they are still read one by one, in the same order.
+  var watchCache = {};
+  function watchPage(vid) {
+    if (!watchCache[vid]) {
+      watchCache[vid] = siteGet(BASE_URL + '/watch.php?vid=' + vid);
+      watchCache[vid].catch(noop);
+    }
+    return watchCache[vid];
+  }
+  slice.forEach(function (it) { watchPage(it.vid); });
+
   function next() {
     if (i >= slice.length) return Promise.resolve(null);
     var item = slice[i++];
-    return siteGet(BASE_URL + '/watch.php?vid=' + item.vid).then(function (html) {
+    return watchPage(item.vid).then(function (html) {
       var serie = serieUrlFromWatch(html);
       if (!serie || seenHub[serie]) return next();
       seenHub[serie] = true;
@@ -1170,7 +1300,12 @@ function getStreams(tmdbId, mediaType, seasonNum, episodeNum) {
       : meta.displayTitle + (meta.year ? ' (' + meta.year + ')' : '');
     log(type + ' "' + meta.displayTitle + '" lang=' + (meta.arabic ? 'ar' : 'en') +
         ' queries=' + JSON.stringify(buildQueries(meta.displayTitle, meta, type, season, episode)));
-    return type === 'tv' ? getSeriesStreams(meta, season, episode, title) : getMovieStreams(meta, title);
+    var started = Date.now();
+    var job = type === 'tv' ? getSeriesStreams(meta, season, episode, title) : getMovieStreams(meta, title);
+    return job.then(function (streams) {
+      log('done in ' + (Date.now() - started) + 'ms, streams=' + streams.length);
+      return streams;
+    });
   }).catch(function (err) {
     log('error: ' + (err && err.message));
     return [];
@@ -1180,7 +1315,7 @@ function getStreams(tmdbId, mediaType, seasonNum, episodeNum) {
 module.exports = {
   id: PROVIDER_ID,
   name: PROVIDER_NAME,
-  version: '1.1.0',
+  version: '1.2.0',
   supportedTypes: ['movie', 'tv'],
   formats: ['m3u8', 'mp4'],
   getStreams: getStreams
