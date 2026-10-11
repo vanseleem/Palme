@@ -227,34 +227,23 @@ function harvestMirrors(html) {
   var text = cleanEscapes(html);
   var m;
 
-  // 1. <option value="URL"> inside <select id="server-select"> (embed.php)
   var reOpt = /<option[^>]+value=["']([^"']+)["'][^>]*>/gi;
-  while ((m = reOpt.exec(text)) !== null) {
-    add(rawMirror(m[1]));
-  }
+  while ((m = reOpt.exec(text)) !== null) add(rawMirror(m[1]));
 
-  // 2. var servers = [...] array with escaped iframe HTML (play.php)
   var reServers = /var\s+servers\s*=\s*\[([\s\S]*?)\];/i;
   var srvMatch = reServers.exec(text);
   if (srvMatch) {
     var srvText = srvMatch[1].replace(/\\"/g, '"');
     var reIframeSrc = /src=["']([^"']+)["']/gi;
-    while ((m = reIframeSrc.exec(srvText)) !== null) {
-      add(rawMirror(m[1]));
-    }
+    while ((m = reIframeSrc.exec(srvText)) !== null) add(rawMirror(m[1]));
   }
 
-  // 3. Plain <iframe src="...">
   var reIf = /<iframe[^>]+src=["']([^"']+)["']/gi;
-  while ((m = reIf.exec(text)) !== null) {
-    add(rawMirror(m[1]));
-  }
+  while ((m = reIf.exec(text)) !== null) add(rawMirror(m[1]));
 
-  // 4. All bare URLs anywhere in the page
   var urls = [];
   collectUrls(text, urls);
 
-  // 5. Base64-encoded URLs
   var reB64 = /["']([A-Za-z0-9+\/]{24,}={0,2})["']/g;
   while ((m = reB64.exec(text)) !== null) {
     var dec = b64decode(m[1]);
@@ -379,51 +368,44 @@ function resolveVid(vid) {
     fetchText(playUrl, BASE + "/").catch(function() { return ""; }),
     fetchText(embedUrl, BASE + "/").catch(function() { return ""; })
   ]).then(function(htmls) {
-    var mirrors = [];
-    var seen = {};
+    var rawMirrors = [];
     htmls.forEach(function(h) {
-      harvestMirrors(h).forEach(function(mir) {
-        var k = mir.embed.toLowerCase();
-        if (seen[k]) return;
-        seen[k] = 1;
-        mirrors.push(mir);
-      });
+      harvestMirrors(h).forEach(function(mir) { rawMirrors.push(mir); });
     });
-    console.log("[QFilm] mirrors found:", mirrors.length, "->", mirrors.map(function(x) { return x.label; }).join(", "));
-    if (!mirrors.length) return [];
 
-    mirrors = mirrors.slice(0, MAX_PROVIDERS);
+    // Dedupe by HOST — one mirror per unique provider host
+    var byHost = {};
+    var hostOrder = [];
+    rawMirrors.forEach(function(mir) {
+      if (byHost[mir.host]) return;
+      byHost[mir.host] = mir;
+      hostOrder.push(mir.host);
+    });
+
+    console.log("[QFilm] unique hosts found:", hostOrder.length, "->", hostOrder.map(function(h) { return byHost[h].label; }).join(", "));
+
+    var mirrors = hostOrder.slice(0, MAX_PROVIDERS).map(function(h) { return byHost[h]; });
+    console.log("[QFilm] resolving", mirrors.length, "of", hostOrder.length, "hosts (MAX_PROVIDERS=" + MAX_PROVIDERS + ")");
+
+    if (!mirrors.length) return [];
 
     return Promise.all(mirrors.map(function(mir) {
       return withTimeout(resolveMirror(mir, embedUrl), MIRROR_TIMEOUT, { mirror: mir, urls: [] });
     })).then(function(results) {
-      var byHost = {};
-      var hostOrder = [];
-      results.forEach(function(r) {
-        var host = r.mirror.host;
-        if (!byHost[host]) {
-          byHost[host] = { label: r.mirror.label, embed: r.mirror.embed, urls: [] };
-          hostOrder.push(host);
-        }
-        r.urls.forEach(function(u) {
-          if (byHost[host].urls.indexOf(u) === -1) byHost[host].urls.push(u);
-        });
-      });
-
       var streams = [];
       var fallbacks = [];
-      hostOrder.forEach(function(host) {
-        var g = byHost[host];
-        if (g.urls.length) {
-          g.urls.sort(function(a, b) {
+      results.forEach(function(r) {
+        var label = r.mirror.label;
+        if (r.urls.length) {
+          r.urls.sort(function(a, b) {
             return qualityRankValue(qualityFromUrl(b)) - qualityRankValue(qualityFromUrl(a));
           });
-          streams.push(makeStream(g.urls[0], g.label, g.embed));
+          streams.push(makeStream(r.urls[0], label, r.mirror.embed));
         } else {
           fallbacks.push({
             name: "🎬 QFilm",
-            title: "🎬 QFilm (Embed) \u2022 " + g.label,
-            url: g.embed,
+            title: "🎬 QFilm (Embed) \u2022 " + label,
+            url: r.mirror.embed,
             quality: "Auto",
             type: "iframe",
             referer: embedUrl
@@ -431,8 +413,11 @@ function resolveVid(vid) {
         }
       });
 
-      console.log("[QFilm] providers resolved:", streams.length, "direct,", fallbacks.length, "embed fallback");
-      return streams.length ? streams : fallbacks;
+      var out = streams.length ? streams : fallbacks;
+      // HARD CAP — guarantees MAX_PROVIDERS regardless of upstream logic
+      out = out.slice(0, MAX_PROVIDERS);
+      console.log("[QFilm] FINAL output:", out.length, "(MAX_PROVIDERS=" + MAX_PROVIDERS + ")");
+      return out;
     });
   }).catch(function(err) {
     console.log("[QFilm] resolveVid error:", err.message);
@@ -470,7 +455,9 @@ function getStreams(tmdbId, mediaType) {
     console.log("[QFilm] Skipping — QFilm is strictly movies only");
     return Promise.resolve([]);
   }
-  return getMovieStreams(tmdbId);
+  return getMovieStreams(tmdbId).then(function(list) {
+    return list.slice(0, MAX_PROVIDERS);
+  });
 }
 
 module.exports = {
