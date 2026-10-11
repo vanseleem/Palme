@@ -1,7 +1,6 @@
 var BASE_URL = 'https://yam.ahwaktv.net';
 var PROVIDER_ID = 'ahwaktv';
 var PROVIDER_NAME = 'AhwakTV';
-
 var TMDB_API_KEY = '83d364331c40bfbe29858aeed82f45cc';
 
 var CONTENT_LANG = 'both';
@@ -11,7 +10,7 @@ var MAX_SEARCH_PAGES = 5;
 var MAX_MOVIE_CANDIDATES = 3;
 var MAX_EPISODE_CANDIDATES = 4;
 var MAX_SERVERS = 6;
-var MAX_QUERIES = 6;
+var MAX_QUERIES = 8;
 var SITE_TIMEOUT = 15000;
 var EMBED_TIMEOUT = 12000;
 
@@ -104,7 +103,13 @@ var ORDINALS = {};
   ['الاول', 1], ['الاولى', 1], ['الثاني', 2], ['الثانية', 2], ['الثالث', 3], ['الثالثة', 3],
   ['الرابع', 4], ['الرابعة', 4], ['الخامس', 5], ['الخامسة', 5], ['السادس', 6], ['السادسة', 6],
   ['السابع', 7], ['السابعة', 7], ['الثامن', 8], ['الثامنة', 8], ['التاسع', 9], ['التاسعة', 9],
-  ['العاشر', 10], ['العاشرة', 10]
+  ['العاشر', 10], ['العاشرة', 10], ['الحادي', 11], ['الحادية', 11], ['الثاني', 12], ['الثانية', 12],
+  ['الثالث', 13], ['الثالثة', 13], ['الرابع', 14], ['الرابعة', 14], ['الخامس', 15], ['الخامسة', 15],
+  ['السادس', 16], ['السادسة', 16], ['السابع', 17], ['السابعة', 17], ['الثامن', 18], ['الثامنة', 18],
+  ['التاسع', 19], ['التاسعة', 19], ['العشرون', 20], ['العشرين', 20], ['الحادي', 21], ['الحادية', 21],
+  ['الثاني', 22], ['الثانية', 22], ['الثالث', 23], ['الثالثة', 23], ['الرابع', 24], ['الرابعة', 24],
+  ['الخامس', 25], ['الخامسة', 25], ['السادس', 26], ['السادسة', 26], ['السابع', 27], ['السابعة', 27],
+  ['الثامن', 28], ['الثامنة', 28], ['التاسع', 29], ['التاسعة', 29], ['الثلاثون', 30], ['الثلاثين', 30]
 ].forEach(function (p) { ORDINALS[normalizeText(p[0])] = p[1]; });
 
 function numberFromToken(token) {
@@ -136,14 +141,44 @@ function parseTitle(raw) {
     for (var e = 0; e < tokens.length; e++) {
       if (EPISODE_WORDS[tokens[e]]) { epIdx = e; break; }
     }
-    if (epIdx !== -1 && /^\d+$/.test(tokens[epIdx + 1] || '')) {
-      info.episode = parseInt(tokens[epIdx + 1], 10);
-      tokens.splice(epIdx, 2);
+    if (epIdx !== -1) {
+      var afterEp = tokens[epIdx + 1];
+      if (afterEp) {
+        if (/^\d+$/.test(afterEp)) {
+          info.episode = parseInt(afterEp, 10);
+          tokens.splice(epIdx, 2);
+        } else {
+          var ord = numberFromToken(afterEp);
+          if (ord) {
+            info.episode = ord;
+            tokens.splice(epIdx, 2);
+          }
+        }
+      }
     }
+
+    if (info.episode !== null) {
+      for (var oi = 0; oi < tokens.length; oi++) {
+        var ordVal = numberFromToken(tokens[oi]);
+        if (ordVal !== null && ordVal === info.episode) {
+          tokens.splice(oi, 1);
+          break;
+        }
+      }
+    }
+
     for (var i = 0; i < tokens.length - 1; i++) {
       if (SEASON_WORDS[tokens[i]]) {
         var n = numberFromToken(tokens[i + 1]);
         if (n) { info.season = n; tokens.splice(i, 2); break; }
+      }
+    }
+
+    if (info.season === null && tokens.length > 1) {
+      var last = tokens[tokens.length - 1];
+      if (/^\d{1,2}$/.test(last)) {
+        info.season = parseInt(last, 10);
+        tokens.pop();
       }
     }
   } else {
@@ -353,6 +388,9 @@ function buildQueries(title, meta, type, season, episode) {
   if (type === 'tv' && season && episode) {
     add(title + ' الحلقة ' + episode);
     add(title + ' الموسم ' + season + ' الحلقة ' + episode);
+    if (season === 1) {
+      add(title + ' الموسم الأول الحلقة ' + episode);
+    }
   }
 
   if (type === 'movie' && meta.year) {
@@ -442,7 +480,6 @@ function searchQueries(queries, onEntries, afterQuery) {
 function scoreMovieEntry(entry, meta) {
   var info = parseTitle(entry.title);
   if (info.kind !== 'movie' && info.kind !== 'play') return null;
-
   if (meta.arabic && SKIP_DUB_SUB_ARABIC && (info.dubbed || info.subbed)) return null;
 
   var yearDiff = meta.year && info.year ? Math.abs(meta.year - info.year) : null;
