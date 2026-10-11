@@ -1,28 +1,15 @@
-// ============================================================================
-//  AhwakTV Scraper for Nuvio — Full Script
-//  Robust steel version with fixed search, keyword generation, and
-//  strict title matching to eliminate false positives.
-// ============================================================================
-
 var BASE_URL = 'https://yam.ahwaktv.net';
 var PROVIDER_ID = 'ahwaktv';
 var PROVIDER_NAME = 'AhwakTV';
 
-// Free key from https://www.themoviedb.org/settings/api
 var TMDB_API_KEY = '83d364331c40bfbe29858aeed82f45cc';
 
-// ───────────────────────── Content language filter ─────────────────────
-// 'arabic'  = only Arabic-original content
-// 'english' = only English-original content
-// 'both'    = both Arabic and English content (default)
 var CONTENT_LANG = 'both';
-
-// true = skip dubbed / subtitled uploads for Arabic-original content
 var SKIP_DUB_SUB_ARABIC = true;
 
-var MAX_SEARCH_PAGES = 5;            // raised from 3
+var MAX_SEARCH_PAGES = 5;
 var MAX_MOVIE_CANDIDATES = 3;
-var MAX_EPISODE_CANDIDATES = 4;      // raised from 2
+var MAX_EPISODE_CANDIDATES = 4;
 var MAX_SERVERS = 6;
 var MAX_QUERIES = 6;
 var SITE_TIMEOUT = 15000;
@@ -31,13 +18,9 @@ var EMBED_TIMEOUT = 12000;
 var UA_SITE = 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Mobile Safari/537.36';
 var UA_EMBED = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
-// ─────────────────────────────── Logging ──────────────────────────────
-
 function log(message) {
   console.log('[AhwakTV] ' + message);
 }
-
-// ───────────────────────────── Text helpers ───────────────────────────
 
 function decodeEntities(str) {
   return String(str == null ? '' : str)
@@ -57,19 +40,18 @@ function toWesternDigits(str) {
     .replace(/[\u06F0-\u06F9]/g, function (c) { return String(c.charCodeAt(0) - 0x06F0); });
 }
 
-// Lower-case, fold Arabic letter variants, drop diacritics/punctuation.
 function normalizeText(input) {
   var s = toWesternDigits(decodeEntities(input)).toLowerCase();
   if (typeof s.normalize === 'function') {
     s = s.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
   }
   s = s
-    .replace(/[\u064B-\u065F\u0670\u0640]/g, '')       // tashkeel, dagger alef, tatweel
-    .replace(/[\u0622\u0623\u0625\u0671]/g, '\u0627')  // alef variants -> alef
-    .replace(/\u0649/g, '\u064A')                       // alef maqsura -> ya
-    .replace(/\u0629/g, '\u0647')                       // ta marbuta -> ha
-    .replace(/\u0624/g, '\u0648')                       // hamza on waw -> waw
-    .replace(/\u0626/g, '\u064A')                       // hamza on ya -> ya
+    .replace(/[\u064B-\u065F\u0670\u0640]/g, '')
+    .replace(/[\u0622\u0623\u0625\u0671]/g, '\u0627')
+    .replace(/\u0649/g, '\u064A')
+    .replace(/\u0629/g, '\u0647')
+    .replace(/\u0624/g, '\u0648')
+    .replace(/\u0626/g, '\u064A')
     .replace(/\u0686/g, '\u062C')
     .replace(/\u067E/g, '\u0628')
     .replace(/\u06A4/g, '\u0641')
@@ -99,8 +81,6 @@ function hasArabicScript(text) {
 function pad2(n) {
   return n < 10 ? '0' + n : String(n);
 }
-
-// ────────────────────────── Title vocabulary ──────────────────────────
 
 var KIND_BY_WORD = {};
 [
@@ -132,13 +112,10 @@ function numberFromToken(token) {
   return ORDINALS[token] || null;
 }
 
-// ─────────────────────── parseTitle (fixed ordering) ───────────────────
-
 function parseTitle(raw) {
   var info = { kind: null, name: '', year: null, season: null, episode: null, dubbed: false, subbed: false };
   var tokens = normalizeText(raw).split(' ').filter(Boolean);
 
-  // Detect kind word within first 3 tokens
   var kindIdx = -1;
   for (var k = 0; k < Math.min(tokens.length, 3); k++) {
     if (KIND_BY_WORD[tokens[k]]) { kindIdx = k; break; }
@@ -148,7 +125,6 @@ function parseTitle(raw) {
     tokens.splice(kindIdx, 1);
   }
 
-  // Remove dub/sub markers
   tokens = tokens.filter(function (t) {
     if (DUB_WORDS[t]) { info.dubbed = true; return false; }
     if (SUB_WORDS[t]) { info.subbed = true; return false; }
@@ -156,7 +132,6 @@ function parseTitle(raw) {
   });
 
   if (info.kind === 'series' || info.kind === 'show') {
-    // Extract episode FIRST (independent of season position)
     var epIdx = -1;
     for (var e = 0; e < tokens.length; e++) {
       if (EPISODE_WORDS[tokens[e]]) { epIdx = e; break; }
@@ -165,7 +140,6 @@ function parseTitle(raw) {
       info.episode = parseInt(tokens[epIdx + 1], 10);
       tokens.splice(epIdx, 2);
     }
-    // Extract season independently
     for (var i = 0; i < tokens.length - 1; i++) {
       if (SEASON_WORDS[tokens[i]]) {
         var n = numberFromToken(tokens[i + 1]);
@@ -173,7 +147,6 @@ function parseTitle(raw) {
       }
     }
   } else {
-    // Year is the last 4-digit 19xx/20xx token
     for (var j = tokens.length - 1; j >= 0; j--) {
       if (/^(19|20)\d\d$/.test(tokens[j])) {
         if (tokens.length > 1) { info.year = parseInt(tokens[j], 10); tokens.splice(j, 1); }
@@ -185,8 +158,6 @@ function parseTitle(raw) {
   info.name = tokens.filter(function (t) { return !NOISE_WORDS[t]; }).join(' ');
   return info;
 }
-
-// ─────────────────────────── Fuzzy comparison ─────────────────────────
 
 function bigramMap(str) {
   var s = str.replace(/ /g, '');
@@ -211,8 +182,6 @@ function diceScore(a, b) {
   });
   return (2 * common) / (x.size + y.size);
 }
-
-// ──────────────────────────────── HTTP ────────────────────────────────
 
 function asciiSafe(value) {
   return String(value).replace(/[^\x00-\x7F]/g, function (c) { return encodeURIComponent(c); });
@@ -266,8 +235,6 @@ function absoluteUrl(url, baseUrl) {
   return '';
 }
 
-// ─────────────────────────── HTML extraction ──────────────────────────
-
 function getAttr(tag, name) {
   var m = new RegExp('\\s' + name + '\\s*=\\s*(?:"([^"]*)"|\'([^\']*)\')', 'i').exec(tag);
   return m ? (m[1] !== undefined ? m[1] : m[2]) : '';
@@ -304,8 +271,6 @@ function parseMaxPage(html) {
   while ((m = re.exec(html)) !== null) max = Math.max(max, parseInt(m[1], 10));
   return max;
 }
-
-// ──────────────────────────────── TMDB ────────────────────────────────
 
 function fetchTmdb(tmdbId, type) {
   var url = 'https://api.themoviedb.org/3/' + type + '/' + encodeURIComponent(tmdbId) +
@@ -348,7 +313,6 @@ function buildMeta(data, type) {
     titles.push({ raw: t, norm: norm });
   });
 
-  // English fallback title (first non-Arabic title)
   var englishTitle = '';
   for (var e = 0; e < titles.length; e++) {
     if (!hasArabicScript(titles[e].raw)) { englishTitle = titles[e].raw; break; }
@@ -370,8 +334,6 @@ function buildMeta(data, type) {
   };
 }
 
-// ─────────────────────── Query generation (multi-variant) ──────────────
-
 function buildQueries(title, meta, type, season, episode) {
   var queries = [];
   var seen = {};
@@ -386,27 +348,22 @@ function buildQueries(title, meta, type, season, episode) {
     queries.push(q);
   }
 
-  // 1. Exact title
   add(title);
 
-  // 2. Title + season + episode (series only)
   if (type === 'tv' && season && episode) {
     add(title + ' الحلقة ' + episode);
     add(title + ' الموسم ' + season + ' الحلقة ' + episode);
   }
 
-  // 3. Title + year (movies only)
   if (type === 'movie' && meta.year) {
     add(title + ' ' + meta.year);
   }
 
-  // 4. Arabic variants: strip leading "ال" or kind word
   if (meta.arabic) {
     if (title.indexOf('ال') === 0) add(title.slice(2));
     add(title.replace(/^(مسلسل|فيلم|مسرحية)\s+/, ''));
   }
 
-  // 5. English fallback if different from display title
   if (meta.englishTitle && meta.englishTitle !== title) {
     add(meta.englishTitle);
     if (type === 'tv' && season && episode) {
@@ -418,12 +375,6 @@ function buildQueries(title, meta, type, season, episode) {
   return queries.slice(0, MAX_QUERIES);
 }
 
-// ─────────────────────── Strict title matching ────────────────────────
-
-// Returns { matched, targetIndex } only if the parsed name matches a target
-// either exactly (token-for-token) or as a contiguous multi-token subsequence.
-// Single-token targets must match exactly — prevents "Friends" from matching
-// "Your Friends & Neighbors".
 function strictTitleMatch(parsedName, targets) {
   var parsedTokens = normalizeText(parsedName).split(' ').filter(Boolean);
   if (!parsedTokens.length) return { matched: false };
@@ -434,13 +385,10 @@ function strictTitleMatch(parsedName, targets) {
     if (!targetTokens.length) continue;
     var targetStr = targetTokens.join(' ');
 
-    // Exact match
     if (parsedStr === targetStr) return { matched: true, targetIndex: i };
 
-    // Single-token target must match exactly
     if (targetTokens.length === 1) continue;
 
-    // Contiguous multi-token match inside longer parsed name
     for (var start = 0; start <= parsedTokens.length - targetTokens.length; start++) {
       var ok = true;
       for (var j = 0; j < targetTokens.length; j++) {
@@ -451,8 +399,6 @@ function strictTitleMatch(parsedName, targets) {
   }
   return { matched: false };
 }
-
-// ─────────────────────────────── Search ───────────────────────────────
 
 function searchPage(query, page) {
   var url = BASE_URL + '/search.php?keywords=' + encodeURIComponent(query) +
@@ -492,8 +438,6 @@ function searchQueries(queries, onEntries, afterQuery) {
   }
   return nextQuery();
 }
-
-// ─────────────────────────────── Movies ───────────────────────────────
 
 function scoreMovieEntry(entry, meta) {
   var info = parseTitle(entry.title);
@@ -576,8 +520,6 @@ function getMovieStreams(meta, title) {
   });
 }
 
-// ─────────────────────────────── Series ───────────────────────────────
-
 function findSeriesEntries(meta, season, episode) {
   var matched = [];
   var seen = {};
@@ -589,7 +531,6 @@ function findSeriesEntries(meta, season, episode) {
       var info = parseTitle(entry.title);
       if (info.kind !== 'series' && info.kind !== 'show') return;
       if (info.episode === null) return;
-      if (meta.arabic && SKIP_DUB_SUB_ARIC && false) return; // placeholder
       if (meta.arabic && SKIP_DUB_SUB_ARABIC && (info.dubbed || info.subbed)) return;
 
       var match = strictTitleMatch(info.name, meta.targets);
@@ -735,13 +676,10 @@ function getSeriesStreams(meta, season, episode, title) {
   });
 }
 
-// ──────────────────────── Servers (see.php) ───────────────────────────
-
 function fetchEmbedUrls(vid) {
   return siteGet(BASE_URL + '/see.php?vid=' + vid, BASE_URL + '/watch.php?vid=' + vid).then(function (html) {
     var urls = [];
     var seen = {};
-    // Primary: data-embed-url attributes
     var re = /data-embed-url\s*=\s*["']([^"']+)["']/gi;
     var m;
     while ((m = re.exec(html)) !== null) {
@@ -750,7 +688,6 @@ function fetchEmbedUrls(vid) {
       seen[url] = true;
       urls.push(url);
     }
-    // Fallback: iframe src
     if (!urls.length) {
       var ire = /<iframe\b[^>]*?\ssrc\s*=\s*["']([^"']+)["']/gi;
       while ((m = ire.exec(html)) !== null) {
@@ -777,10 +714,6 @@ function serverLabel(host) {
   if (/listeamed/.test(host)) return 'Listeamed';
   return host.split('.').slice(-2, -1)[0] || host;
 }
-
-// ───────────────────────────── Extractors ─────────────────────────────
-
-var QUALITY_RANK_AUTO = 1080;
 
 function qualityFromUrl(url) {
   var m = /(\d{3,4})p\b/i.exec(url);
@@ -924,12 +857,15 @@ function resolveEmbed(embedUrl) {
   });
 }
 
-// ─────────────────────────── Stream assembly ──────────────────────────
-
 function qualityRank(q) {
-  if (q === 'Auto') return QUALITY_RANK_AUTO;
+  if (q === 'Auto') return 9999;
   var n = parseInt(q, 10);
   return isNaN(n) ? 0 : n;
+}
+
+function displayQuality(q) {
+  if (q === 'Auto' || q === 'Unknown' || !q) return 'Auto';
+  return q;
 }
 
 function getServerStreams(vid, title) {
@@ -937,29 +873,41 @@ function getServerStreams(vid, title) {
     log('servers for ' + vid + ': ' + embedUrls.length);
     return Promise.all(embedUrls.slice(0, MAX_SERVERS).map(resolveEmbed));
   }).then(function (groups) {
-    var streams = [];
-    var seen = {};
+    var byServer = {};
     groups.forEach(function (items) {
       items.forEach(function (it) {
-        if (seen[it.url]) return;
-        seen[it.url] = true;
-        streams.push({
-          name: PROVIDER_NAME + ' ' + it.server + (it.quality !== 'Unknown' ? ' ' + it.quality : ''),
-          title: title,
-          url: it.url,
-          quality: it.quality,
-          size: 'Unknown',
-          headers: it.headers,
-          provider: PROVIDER_ID
-        });
+        if (!it || !it.url) return;
+        var key = it.server || 'Server';
+        var rank = qualityRank(it.quality);
+        if (!byServer[key] || rank > byServer[key].rank) {
+          byServer[key] = { server: key, rank: rank, item: it };
+        }
       });
     });
+
+    var streams = [];
+    var seenUrls = {};
+    Object.keys(byServer).forEach(function (k) {
+      var entry = byServer[k];
+      var it = entry.item;
+      if (seenUrls[it.url]) return;
+      seenUrls[it.url] = true;
+      var shownQuality = displayQuality(it.quality);
+      streams.push({
+        name: PROVIDER_NAME + ' ' + entry.server + ' ' + shownQuality,
+        title: title,
+        url: it.url,
+        quality: shownQuality,
+        size: 'Unknown',
+        headers: it.headers,
+        provider: PROVIDER_ID
+      });
+    });
+
     streams.sort(function (a, b) { return qualityRank(b.quality) - qualityRank(a.quality); });
     return streams;
   });
 }
-
-// ───────────────────────────── Entry point ────────────────────────────
 
 function getStreams(tmdbId, mediaType, seasonNum, episodeNum) {
   var type = mediaType === 'tv' || mediaType === 'series' ? 'tv' : 'movie';
@@ -993,9 +941,6 @@ function getStreams(tmdbId, mediaType, seasonNum, episodeNum) {
   });
 }
 
-// ============================================================================
-//  Nuvio plugin contract
-// ============================================================================
 module.exports = {
   id: PROVIDER_ID,
   name: PROVIDER_NAME,
