@@ -15,13 +15,6 @@ var MAX_QUERIES = 10;
 var SITE_TIMEOUT = 15000;
 var EMBED_TIMEOUT = 12000;
 
-// Speed settings for the series search (matching logic is NOT affected by any of these).
-var SEARCH_TIMEOUT = 9000;        // one search page; a normal page answers in well under 2s
-var HUB_TIMEOUT = 8000;           // one series-hub guess
-var SEARCH_CONCURRENCY = 6;       // search pages fetched at the same time
-var SEARCH_BUDGET_MS = 14000;     // stop paging the site after this long and use what was found
-var EARLY_STOP_UNNUMBERED_S1 = false; // true = also stop early on season-1 titles with no season label (faster, slightly different pick order)
-
 var UA_SITE = 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Mobile Safari/537.36';
 var UA_EMBED = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
@@ -77,7 +70,7 @@ function normalizedSet(words) {
 function cleanQuery(text) {
   return decodeEntities(text)
     .replace(/[\u060C\u061B\u061F\u066A-\u066D\u06D4]/g, ' ')
-    .replace(/[!-\/:-@\[-`{-\~]/g, ' ')
+    .replace(/[!-\/:-@\[-`{-\\~]/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
 }
@@ -279,76 +272,13 @@ function fetchText(url, headers, timeoutMs) {
     });
 }
 
-function siteGet(url, referer, timeoutMs) {
+function siteGet(url, referer) {
   return fetchText(url, {
     'User-Agent': UA_SITE,
     'Referer': referer || BASE_URL + '/',
     'Accept': 'text/html,application/xhtml+xml',
     'Accept-Language': 'ar,en;q=0.9'
-  }, timeoutMs || SITE_TIMEOUT);
-}
-
-function noop() {}
-
-function delay(ms) {
-  if (typeof setTimeout !== 'function') return Promise.resolve();
-  return new Promise(function (resolve) { setTimeout(resolve, ms); });
-}
-
-// One retry for a failed (non-timeout) request, so a single hiccup cannot drop a search page.
-function siteGetRetry(url, timeoutMs) {
-  function attempt(n) {
-    return siteGet(url, null, timeoutMs).catch(function (err) {
-      if (n >= 1 || /^timeout/.test(String(err && err.message))) throw err;
-      return delay(250).then(function () { return attempt(n + 1); });
-    });
-  }
-  return attempt(0);
-}
-
-// Runs jobs with a concurrency limit. The job with the lowest key always starts first,
-// so the requests the search needs soonest are never queued behind later ones.
-function createPool(limit) {
-  var active = 0;
-  var queue = [];
-  var closed = false;
-
-  function start(job) {
-    var p;
-    try { p = Promise.resolve(job.run()); } catch (e) { p = Promise.reject(e); }
-    p.then(
-      function (v) { active--; job.resolve(v); pump(); },
-      function (e) { active--; job.reject(e); pump(); }
-    );
-  }
-
-  function pump() {
-    while (!closed && active < limit && queue.length) {
-      var best = 0;
-      for (var i = 1; i < queue.length; i++) {
-        if (queue[i].key < queue[best].key) best = i;
-      }
-      var job = queue.splice(best, 1)[0];
-      active++;
-      start(job);
-    }
-  }
-
-  return {
-    add: function (key, run) {
-      if (closed) return Promise.reject(new Error('cancelled'));
-      return new Promise(function (resolve, reject) {
-        queue.push({ key: key, run: run, resolve: resolve, reject: reject });
-        pump();
-      });
-    },
-    close: function () {
-      closed = true;
-      var pending = queue;
-      queue = [];
-      pending.forEach(function (j) { j.reject(new Error('cancelled')); });
-    }
-  };
+  }, SITE_TIMEOUT);
 }
 
 function hostOf(url) {
@@ -466,6 +396,18 @@ function buildMeta(data, type) {
     englishTitle: englishTitle,
     targets: titles.map(function (t) { return t.norm; }),
     rawTitles: titles.slice(0, 4).map(function (t) { return t.raw; }),
+    slugTitles: (function () {
+      var seen = {};
+      var out = [];
+      raw.forEach(function (t) {
+        if (!t) return;
+        var norm = normalizeText(t);
+        if (!norm || seen[norm]) return;
+        seen[norm] = true;
+        out.push(t);
+      });
+      return out.slice(0, 6);
+    })(),
     queries: titles.slice(0, 3).map(function (t) { return cleanQuery(t.raw); }).filter(Boolean)
   };
 }
@@ -493,7 +435,9 @@ function buildQueries(title, meta, type, season, episode) {
 
   if (type === 'tv' && season) {
     var arSeason = arabicOrdinal(season);
+    var epWord = episode && EP_ORDINALS[episode];
     if (episode) {
+      if (epWord) add(title + ' الحلقة ' + episode + ' ' + epWord);
       add(title + ' الحلقة ' + episode);
       add(title + ' الموسم ' + season + ' الحلقة ' + episode);
       if (arSeason) add(title + ' الموسم ' + arSeason + ' الحلقة ' + episode);
@@ -519,13 +463,15 @@ function buildQueries(title, meta, type, season, episode) {
   if (meta.englishTitle && meta.englishTitle !== title) {
     add(meta.englishTitle);
     if (type === 'tv' && season && episode) {
+      var epWordEn = EP_ORDINALS[episode];
+      if (epWordEn) add(meta.englishTitle + ' الحلقة ' + episode + ' ' + epWordEn);
       add(meta.englishTitle + ' الحلقة ' + episode);
       add(meta.englishTitle + ' الموسم ' + season + ' الحلقة ' + episode);
       add(meta.englishTitle + ' الجزء ' + season + ' الحلقة ' + episode);
     }
   }
 
-  return queries.slice(0, MAX_QUERIES);
+  return queries;
 }
 
 function strictTitleMatch(parsedName, targets) {
@@ -556,10 +502,10 @@ function strictTitleMatch(parsedName, targets) {
   return { matched: false };
 }
 
-function searchPage(query, page, fast) {
+function searchPage(query, page) {
   var url = BASE_URL + '/search.php?keywords=' + encodeURIComponent(query) +
     (page > 1 ? '&page=' + page : '');
-  return (fast ? siteGetRetry(url, SEARCH_TIMEOUT) : siteGet(url)).then(function (html) {
+  return siteGet(url).then(function (html) {
     return {
       entries: parseWatchAnchors(html).filter(function (a) { return a.title; }),
       maxPage: parseMaxPage(html)
@@ -567,12 +513,10 @@ function searchPage(query, page, fast) {
   });
 }
 
-function searchPages(query, onEntries, session, qi) {
+function searchPages(query, onEntries) {
   var page = 1;
   function step() {
-    if (session && session.expired()) return Promise.resolve(false);
-    var request = session ? session.page(qi, page) : searchPage(query, page);
-    return request.then(function (res) {
+    return searchPage(query, page).then(function (res) {
       if (onEntries(res.entries)) return true;
       if (page >= MAX_SEARCH_PAGES || page >= res.maxPage) return false;
       page += 1;
@@ -585,49 +529,16 @@ function searchPages(query, onEntries, session, qi) {
   return step();
 }
 
-function searchQueries(queries, onEntries, afterQuery, session) {
+function searchQueries(queries, onEntries, afterQuery) {
   var qi = 0;
   function nextQuery() {
     if (qi >= queries.length) return Promise.resolve(false);
-    if (session && session.expired()) return Promise.resolve(false);
-    var idx = qi++;
-    return searchPages(queries[idx], onEntries, session, idx).then(function (stop) {
+    return searchPages(queries[qi++], onEntries).then(function (stop) {
       if (stop || (afterQuery && afterQuery())) return true;
       return nextQuery();
     });
   }
   return nextQuery();
-}
-
-// Series only: fetches the search pages ahead of the (unchanged) one-by-one reading below,
-// in the exact order they will be read, and drops whatever is still queued once reading stops.
-function createSearchSession(queries) {
-  var pool = createPool(SEARCH_CONCURRENCY);
-  var pages = {};
-  var startedAt = Date.now();
-
-  function request(qi, page) {
-    var key = qi + ':' + page;
-    if (pages[key]) return pages[key];
-    var p = pool.add(qi * 100 + page, function () { return searchPage(queries[qi], page, true); });
-    p.catch(noop);
-    pages[key] = p;
-    if (page === 1) {
-      p.then(function (res) {
-        var last = Math.min(MAX_SEARCH_PAGES, res.maxPage);
-        for (var n = 2; n <= last; n++) request(qi, n);
-      }, noop);
-    }
-    return p;
-  }
-
-  queries.forEach(function (q, qi) { request(qi, 1); });
-
-  return {
-    page: request,
-    expired: function () { return Date.now() - startedAt > SEARCH_BUDGET_MS; },
-    close: function () { pool.close(); }
-  };
 }
 
 function scoreMovieEntry(entry, meta) {
@@ -653,7 +564,7 @@ function scoreMovieEntry(entry, meta) {
 function findMovieCandidates(meta) {
   var found = [];
   var seen = {};
-  var queries = buildQueries(meta.displayTitle, meta, 'movie', null, null);
+  var queries = buildQueries(meta.displayTitle, meta, 'movie', null, null).slice(0, MAX_QUERIES);
 
   function onEntries(entries) {
     var confident = false;
@@ -735,7 +646,6 @@ function matchFlexible(name, targets) {
         rest = rest.slice(1);
       }
     }
-    // Extra words with no season number are a different show (Dead City, Your Friends).
     if (rest.length && season === null) continue;
     if (rest.length > 5) continue;
     return { season: season, targetIndex: t };
@@ -800,8 +710,6 @@ function episodeFromAnchor(a) {
   return { info: info, episode: ep };
 }
 
-// Season buttons are printed before every list, so button position is not the season.
-// The id="SeasonN" block is.
 function parseSeasonBlocks(html) {
   var marks = [];
   var re = /id=["']Season(\d+)["']/gi;
@@ -867,6 +775,75 @@ function findFlat(html, targets, season, episode, arabic) {
   return hit;
 }
 
+var EP_ORDINALS = {
+  1: 'الاولي', 2: 'الثانية', 3: 'الثالثة', 4: 'الرابعة', 5: 'الخامسة',
+  6: 'السادسة', 7: 'السابعة', 8: 'الثامنة', 9: 'التاسعة', 10: 'العاشرة'
+};
+
+function episodeOrdinalInQuery(tokens, episode) {
+  var word = EP_ORDINALS[episode];
+  if (!word) return false;
+  var norm = normalizeText(word);
+  for (var i = 0; i < tokens.length; i++) {
+    if (tokens[i] === norm) return true;
+  }
+  return false;
+}
+
+function seriesQueryRank(query, season, episode) {
+  var tokens = normalizeText(query).split(' ').filter(Boolean);
+  var hasEp = false;
+  var hasSeason = false;
+  for (var i = 0; i < tokens.length; i++) {
+    if (EPISODE_WORDS[tokens[i]] && tokens[i + 1] === String(episode)) hasEp = true;
+    if (SEASON_WORDS[tokens[i]]) hasSeason = true;
+  }
+  if (!hasSeason) {
+    for (var j = 0; j < tokens.length; j++) {
+      if (tokens[j] === String(season) && !EPISODE_WORDS[tokens[j - 1]]) hasSeason = true;
+    }
+  }
+  if (hasEp && hasSeason) return 0;
+  if (hasEp && episodeOrdinalInQuery(tokens, episode)) return 0;
+  if (hasEp) return 1;
+  if (hasSeason) return 2;
+  return 3;
+}
+
+function queryUsesEnglishTitle(query, meta) {
+  if (!meta || !meta.englishTitle) return false;
+  var nameTokens = normalizeText(meta.englishTitle).split(' ').filter(Boolean);
+  if (!nameTokens.length) return false;
+  var tokens = normalizeText(query).split(' ').filter(Boolean);
+  if (tokens[0] === normalizeText('مسلسل') || tokens[0] === normalizeText('فيلم')) tokens.shift();
+  if (tokens.length < nameTokens.length) return false;
+  for (var i = 0; i < nameTokens.length; i++) {
+    if (tokens[i] !== nameTokens[i]) return false;
+  }
+  return true;
+}
+
+function prioritizeSeriesQueries(queries, season, episode, meta) {
+  var preferLatin = meta && !meta.arabic && meta.englishTitle;
+  return queries.map(function (q, i) {
+    return { q: q, i: i, r: seriesQueryRank(q, season, episode) };
+  }).sort(function (a, b) {
+    if (a.r !== b.r) return a.r - b.r;
+    if (preferLatin) {
+      var ae = queryUsesEnglishTitle(a.q, meta);
+      var be = queryUsesEnglishTitle(b.q, meta);
+      if (ae !== be) return ae ? -1 : 1;
+    }
+    return a.i - b.i;
+  }).map(function (x) { return x.q; });
+}
+
+function isDirectEpisode(m, season, episode) {
+  if (!m || !m.info || m.info.episode !== episode) return false;
+  if (m.seasonHint === season) return true;
+  return season === 1 && m.seasonHint == null;
+}
+
 function hubUrls(meta) {
   var urls = [];
   var seen = {};
@@ -875,30 +852,58 @@ function hubUrls(meta) {
     seen[url] = true;
     urls.push(url);
   }
-  (meta.rawTitles || []).forEach(function (raw) {
+  var sources = (meta.slugTitles && meta.slugTitles.length) ? meta.slugTitles : (meta.rawTitles || []);
+  var items = [];
+  sources.forEach(function (raw) {
     var clean = String(raw || '').replace(/\([^)]*\)/g, ' ').replace(/\s+/g, ' ').trim();
     if (!clean) return;
     if (hasArabicScript(clean)) {
       var hyph = clean.replace(/\s+/g, '-');
-      var yeh = hyph.replace(/\u064A/g, '\u0649');
-      add(BASE_URL + '/view-serie.php?name=' + encodeURIComponent(hyph));
-      add(BASE_URL + '/view-serie.php?name=' + encodeURIComponent(yeh));
-      add(BASE_URL + '/view-serie.php?name=' + encodeURIComponent(hyph.replace(/\u0623/g, '\u0627').replace(/\u0625/g, '\u0627')));
-      add(BASE_URL + '/view-serie.php?name=' + encodeURIComponent(clean));
+      items.push({
+        ar: true,
+        hyph: hyph,
+        yeh: hyph.replace(/\u064A/g, '\u0649'),
+        bare: hyph.replace(/\u0623/g, '\u0627').replace(/\u0625/g, '\u0627')
+      });
     } else {
-      var slug = clean.replace(/['’"\.:,!؟?]/g, '').replace(/\s+/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '');
-      var low = slug.toLowerCase();
-      add(BASE_URL + '/view-serie.php?name=' + encodeURIComponent(low));
-      add(BASE_URL + '/view-serie.php?name=' + encodeURIComponent('مسلسل-' + low));
-      add(BASE_URL + '/category.php?cat=' + encodeURIComponent(slug + '-series-full-episodes'));
+      var folded = clean;
+      if (typeof folded.normalize === 'function') folded = folded.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+      var slug = folded.replace(/['’"\.:,!؟?]/g, '').replace(/\s+/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '');
+      items.push({ ar: false, low: slug.toLowerCase(), rawSlug: slug });
     }
+  });
+  function wave(fn) {
+    items.forEach(function (it) {
+      var path = fn(it);
+      if (path) add(BASE_URL + path);
+    });
+  }
+  wave(function (it) {
+    return '/view-serie.php?name=' + encodeURIComponent(it.ar ? it.hyph : it.low);
+  });
+  wave(function (it) {
+    return '/view-serie.php?name=' + encodeURIComponent('مسلسل-' + (it.ar ? it.hyph : it.low));
+  });
+  wave(function (it) {
+    if (it.ar) return '/view-serie.php?name=' + encodeURIComponent(it.hyph + '-مترجم');
+    return '/view-serie.php?name=' + encodeURIComponent('مسلسل-' + it.low + '-مترجم');
+  });
+  wave(function (it) {
+    if (it.ar) return '/view-serie.php?name=' + encodeURIComponent(it.hyph + '-مدبلج');
+    return '/category.php?cat=' + encodeURIComponent(it.rawSlug + '-series-full-episodes');
+  });
+  wave(function (it) {
+    if (!it.ar) return null;
+    if (it.yeh !== it.hyph) return '/view-serie.php?name=' + encodeURIComponent(it.yeh);
+    if (it.bare !== it.hyph) return '/view-serie.php?name=' + encodeURIComponent(it.bare);
+    return null;
   });
   return urls.slice(0, 8);
 }
 
 function loadHubs(meta) {
   return Promise.all(hubUrls(meta).map(function (url) {
-    return siteGet(url, null, HUB_TIMEOUT).then(function (html) {
+    return siteGet(url).then(function (html) {
       if (!hubMatches(html, meta.targets)) return null;
       return { url: url, html: html, blocks: parseSeasonBlocks(html) };
     }).catch(function () { return null; });
@@ -909,14 +914,8 @@ function findSeriesMatches(meta, season, episode) {
   var matched = [];
   var seen = {};
 
-  function isExplicit(info, hint) {
-    if (info.episode !== episode) return false;
-    if (hint === season) return true;
-    return EARLY_STOP_UNNUMBERED_S1 && season === 1 && hint == null;
-  }
-
-  function onEntries(entries) {
-    var haveExplicit = false;
+  function absorb(entries) {
+    var added = 0;
     entries.forEach(function (entry) {
       if (seen[entry.vid]) return;
       var info = parseTitle(entry.title || '');
@@ -926,23 +925,70 @@ function findSeriesMatches(meta, season, episode) {
       if (!mm) return;
       seen[entry.vid] = true;
       var hint = seasonHintOf(info, mm);
-      matched.push({ vid: entry.vid, title: entry.title, info: info, seasonHint: hint });
-      if (isExplicit(info, hint)) haveExplicit = true;
+      matched.push({ vid: entry.vid, title: entry.title, info: info, seasonHint: hint, partial: !!mm.partial });
+      added++;
     });
-    return haveExplicit;
+    return added;
   }
 
-  var queries = buildQueries(meta.displayTitle, meta, 'tv', season, episode);
-  var session = createSearchSession(queries);
-  return searchQueries(queries, onEntries, function () {
-    return matched.some(function (m) { return isExplicit(m.info, m.seasonHint); });
-  }, session).then(function () {
-    session.close();
-    return matched;
-  }, function (err) {
-    session.close();
-    throw err;
-  });
+  function exactDirect() {
+    return matched.some(function (m) { return !m.partial && isDirectEpisode(m, season, episode); });
+  }
+
+  var queries = prioritizeSeriesQueries(
+    buildQueries(meta.displayTitle, meta, 'tv', season, episode),
+    season,
+    episode,
+    meta
+  ).slice(0, MAX_QUERIES);
+  var qi = 0;
+  var WAVE = 4;
+
+  function searchOne(query, page) {
+    return searchPage(query, page).then(function (res) {
+      return res.entries;
+    }).catch(function (err) {
+      log('search failed (' + query + ' p' + page + '): ' + (err && err.message));
+      return [];
+    });
+  }
+
+  function finishSpecific() {
+    if (exactDirect() || !matched.length) return Promise.resolve(matched);
+    var top = [];
+    for (var i = 0; i < queries.length && top.length < 2; i++) {
+      if (seriesQueryRank(queries[i], season, episode) <= 1) top.push(queries[i]);
+    }
+    if (!top.length) return Promise.resolve(matched);
+    return Promise.all(top.map(function (q) { return searchOne(q, 2); })).then(function (groups) {
+      groups.forEach(absorb);
+      return matched;
+    });
+  }
+
+  function wave() {
+    if (exactDirect()) return Promise.resolve(matched);
+    if (qi >= queries.length) return finishSpecific();
+    var nextRank = seriesQueryRank(queries[qi], season, episode);
+    if (nextRank >= 2) {
+      if (matched.length) return finishSpecific();
+      var bare = queries[qi];
+      return searchOne(bare, 1).then(function (entries) {
+        absorb(entries);
+        return matched;
+      });
+    }
+    var batch = [];
+    while (batch.length < WAVE && qi < queries.length && seriesQueryRank(queries[qi], season, episode) <= 1) {
+      batch.push(queries[qi++]);
+    }
+    return Promise.all(batch.map(function (q) { return searchOne(q, 1); })).then(function (groups) {
+      groups.forEach(absorb);
+      return wave();
+    });
+  }
+
+  return wave();
 }
 
 function serieUrlFromWatch(html) {
@@ -950,36 +996,26 @@ function serieUrlFromWatch(html) {
   return m ? absoluteUrl(m[1], BASE_URL) : '';
 }
 
-function probeMatches(matches, meta, season, episode) {
+function probeMatches(matches, meta, season, episode, limit) {
   var ordered = [];
   function take(pred) {
     matches.forEach(function (m) {
       if (pred(m) && ordered.indexOf(m) === -1) ordered.push(m);
     });
   }
+  take(function (m) { return m.seasonHint === season && !m.partial; });
   take(function (m) { return m.seasonHint === season; });
+  take(function (m) { return m.seasonHint == null && !m.partial; });
   take(function (m) { return m.seasonHint == null; });
   take(function () { return true; });
 
-  var slice = ordered.slice(0, 5);
+  var slice = ordered.slice(0, limit || 5);
   var i = 0;
   var seenHub = {};
-
-  // Watch pages are fetched together up front; they are still read one by one, in the same order.
-  var watchCache = {};
-  function watchPage(vid) {
-    if (!watchCache[vid]) {
-      watchCache[vid] = siteGet(BASE_URL + '/watch.php?vid=' + vid);
-      watchCache[vid].catch(noop);
-    }
-    return watchCache[vid];
-  }
-  slice.forEach(function (it) { watchPage(it.vid); });
-
   function next() {
     if (i >= slice.length) return Promise.resolve(null);
     var item = slice[i++];
-    return watchPage(item.vid).then(function (html) {
+    return siteGet(BASE_URL + '/watch.php?vid=' + item.vid).then(function (html) {
       var serie = serieUrlFromWatch(html);
       if (!serie || seenHub[serie]) return next();
       seenHub[serie] = true;
@@ -1006,15 +1042,24 @@ function collectSeriesVids(meta, season, episode) {
     if (vids.length) return vids;
     return findSeriesMatches(meta, season, episode).then(function (matches) {
       log('series title hits: ' + matches.length);
-      return probeMatches(matches, meta, season, episode).then(function (probed) {
-        add(probed);
-        matches.forEach(function (m) {
-          if (m.info.episode === episode && m.seasonHint === season) add(m.vid);
-        });
-        if (season === 1) {
-          matches.forEach(function (m) {
-            if (m.info.episode === episode && m.seasonHint == null) add(m.vid);
-          });
+      function addMatching(pred) {
+        matches.forEach(function (m) { if (pred(m) && !m.partial) add(m.vid); });
+        matches.forEach(function (m) { if (pred(m) && m.partial) add(m.vid); });
+      }
+      var explicit = matches.some(function (m) {
+        return !m.partial && m.info.episode === episode && m.seasonHint === season;
+      });
+      addMatching(function (m) { return m.info.episode === episode && m.seasonHint === season; });
+      if (season === 1) {
+        addMatching(function (m) { return m.info.episode === episode && m.seasonHint == null; });
+      }
+      if (explicit) return vids;
+      var probeLimit = vids.length ? 1 : 2;
+      return probeMatches(matches, meta, season, episode, probeLimit).then(function (probed) {
+        if (probed) {
+          var at = vids.indexOf(probed);
+          if (at !== -1) vids.splice(at, 1);
+          vids.unshift(probed);
         }
         return vids;
       });
@@ -1068,7 +1113,7 @@ function fetchEmbedUrls(vid) {
 }
 
 function serverLabel(host) {
-  if (/(^|\.)vk\.com\( |vkvideo\.ru \)/.test(host)) return 'VK';
+  if (/(^|\.)vk\.com\( |(^|\.)vkvideo\.ru \)/.test(host)) return 'VK';
   if (/(^|\.)ok\.ru$/.test(host)) return 'OK.ru';
   if (/uqload/.test(host)) return 'Uqload';
   if (/vidmoly/.test(host)) return 'Vidmoly';
@@ -1300,12 +1345,7 @@ function getStreams(tmdbId, mediaType, seasonNum, episodeNum) {
       : meta.displayTitle + (meta.year ? ' (' + meta.year + ')' : '');
     log(type + ' "' + meta.displayTitle + '" lang=' + (meta.arabic ? 'ar' : 'en') +
         ' queries=' + JSON.stringify(buildQueries(meta.displayTitle, meta, type, season, episode)));
-    var started = Date.now();
-    var job = type === 'tv' ? getSeriesStreams(meta, season, episode, title) : getMovieStreams(meta, title);
-    return job.then(function (streams) {
-      log('done in ' + (Date.now() - started) + 'ms, streams=' + streams.length);
-      return streams;
-    });
+    return type === 'tv' ? getSeriesStreams(meta, season, episode, title) : getMovieStreams(meta, title);
   }).catch(function (err) {
     log('error: ' + (err && err.message));
     return [];
@@ -1315,7 +1355,7 @@ function getStreams(tmdbId, mediaType, seasonNum, episodeNum) {
 module.exports = {
   id: PROVIDER_ID,
   name: PROVIDER_NAME,
-  version: '1.2.0',
+  version: '1.3.0',
   supportedTypes: ['movie', 'tv'],
   formats: ['m3u8', 'mp4'],
   getStreams: getStreams
