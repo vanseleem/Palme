@@ -70,7 +70,7 @@ function normalizedSet(words) {
 function cleanQuery(text) {
   return decodeEntities(text)
     .replace(/[\u060C\u061B\u061F\u066A-\u066D\u06D4]/g, ' ')
-    .replace(/[!-\/:-@\[-`{-\\~]/g, ' ')
+    .replace(/[!-\/:-@\[-`{-~]/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
 }
@@ -1108,12 +1108,13 @@ function fetchEmbedUrls(vid) {
         urls.push(u);
       }
     }
+    if (!urls.length) log('see.php?vid=' + vid + ' gave no embeds (html ' + html.length + ' chars)');
     return urls;
   });
 }
 
 function serverLabel(host) {
-  if (/(^|\.)vk\.com\( |(^|\.)vkvideo\.ru \)/.test(host)) return 'VK';
+  if (/(^|\.)(vk\.com|vkvideo\.ru)$/.test(host)) return 'VK';
   if (/(^|\.)ok\.ru$/.test(host)) return 'OK.ru';
   if (/uqload/.test(host)) return 'Uqload';
   if (/vidmoly/.test(host)) return 'Vidmoly';
@@ -1256,11 +1257,12 @@ function extractOk(embedUrl) {
 function resolveEmbed(embedUrl) {
   var host = hostOf(embedUrl);
   var job;
-  if (/(^|\.)vk\.com\( |(^|\.)vkvideo\.ru \)/.test(host)) job = extractVk(embedUrl);
+  if (/(^|\.)(vk\.com|vkvideo\.ru)$/.test(host)) job = extractVk(embedUrl);
   else if (/(^|\.)ok\.ru$/.test(host)) job = extractOk(embedUrl);
   else job = extractGeneric(embedUrl);
   return job.then(function (items) {
     var label = serverLabel(host);
+    log(label + ' -> ' + items.length + ' stream(s)');
     return items.map(function (it) { it.server = label; return it; });
   }).catch(function (err) {
     log(serverLabel(host) + ' failed: ' + (err && err.message));
@@ -1316,6 +1318,7 @@ function getServerStreams(vid, title) {
     });
 
     streams.sort(function (a, b) { return qualityRank(b.quality) - qualityRank(a.quality); });
+    log('streams for ' + vid + ': ' + streams.length);
     return streams;
   });
 }
@@ -1355,7 +1358,7 @@ function getStreams(tmdbId, mediaType, seasonNum, episodeNum) {
 module.exports = {
   id: PROVIDER_ID,
   name: PROVIDER_NAME,
-  version: '1.3.0',
+  version: '1.3.1',
   supportedTypes: ['movie', 'tv'],
   formats: ['m3u8', 'mp4'],
   getStreams: getStreams
