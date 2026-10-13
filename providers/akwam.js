@@ -1,4 +1,3 @@
-
 var BASE = "https://akwam.ss";
 var UA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Mobile Safari/537.36";
 var TMDB_API_KEY = "83d364331c40bfbe29858aeed82f45cc";
@@ -6,6 +5,21 @@ var MAX_SERVERS = 10;
 var MAX_CANDIDATE_PAGES = 4;
 var MAX_QUERIES = 6;
 var FETCH_TIMEOUT_MS = 12000;
+
+/* anti-stall / playback probing */
+var SEARCH_CONCURRENCY = 3;        /* parallel search requests (the site rate-limits bursts) */
+var WATCH_CONCURRENCY = 4;         /* parallel watch-page requests */
+var MAX_PROBES = 8;                /* max stream URLs that get speed-tested */
+var PROBE_CONCURRENCY = 4;
+var PROBE_BYTES = 512 * 1024;      /* size of the ranged sample used to measure speed */
+var PROBE_TIMEOUT_MS = 6000;       /* per probe */
+var PROBE_BUDGET_MS = 12000;       /* all probes together; whatever finished by then is used */
+var BUFFER_SECONDS = 10;           /* seconds of video that should be buffered before a smooth start */
+var SAFE_RATIO = 1.8;              /* measured speed / needed bitrate for "will not stall" */
+var MARGINAL_RATIO = 1.1;
+var MAX_STARTUP_S = 8;
+var TRY_HTTP_FALLBACK = true;      /* if https is slow/broken, test the same file over http */
+var HTTP_RETRY_BELOW_BPS = 350 * 1024;
 
 function log() {
   try {
@@ -61,6 +75,24 @@ function fetchText(url, referer, attempt) {
 
 function getJson(url) {
   return fetchText(url).then(function (t) { return JSON.parse(t); }).catch(function () { return null; });
+}
+
+/* run fn over items with at most `limit` in flight; results keep the input order */
+function mapPool(items, limit, fn) {
+  var i = 0;
+  var out = new Array(items.length);
+  function worker() {
+    if (i >= items.length) return Promise.resolve();
+    var idx = i++;
+    return fn(items[idx], idx).then(function (v) {
+      out[idx] = v;
+      return worker();
+    });
+  }
+  var n = Math.max(1, Math.min(limit, items.length));
+  var workers = [];
+  for (var w = 0; w < n; w++) workers.push(worker());
+  return Promise.all(workers).then(function () { return out; });
 }
 
 /* ------------------------------------------------------------------ */
@@ -334,10 +366,25 @@ function getMeta(tmdbId, mediaType) {
     var dateStr = isMovie ? d.release_date : d.first_air_date;
     var year = dateStr ? Number(String(dateStr).slice(0, 4)) : null;
     if (!titles.length) throw new Error("No usable TMDB titles for " + tmdbId);
-    log("TMDB titles:", titles.join(" | "), "year:", year || "?");
+
+    /* runtime in minutes: lets us work out the bitrate a file needs, to judge if it will stall */
+    var runtime = 0;
+    if (isMovie) {
+      runtime = Number((en && en.runtime) || (ar && ar.runtime)) || 0;
+    } else {
+      runtime = Number(
+        (en && en.episode_run_time && en.episode_run_time[0]) ||
+        (ar && ar.episode_run_time && ar.episode_run_time[0]) ||
+        (en && en.last_episode_to_air && en.last_episode_to_air.runtime) ||
+        (ar && ar.last_episode_to_air && ar.last_episode_to_air.runtime)
+      ) || 0;
+    }
+    if (!(runtime > 0)) runtime = isMovie ? 105 : 45;
+
+    log("TMDB titles:", titles.join(" | "), "year:", year || "?", "runtime:", runtime + "m");
     var oc = (!isMovie && d.origin_country && d.origin_country[0]) ? String(d.origin_country[0]).toUpperCase() : "";
     var dropTokens = oc === "US" ? makeSet("us usa") : (oc === "GB" ? makeSet("uk") : null);
-    return { titles: titles, year: year, title: titles[0], isMovie: isMovie, dropTokens: dropTokens };
+    return { titles: titles, year: year, title: titles[0], isMovie: isMovie, dropTokens: dropTokens, runtime: runtime };
   });
 }
 
@@ -423,7 +470,8 @@ function searchAkwam(query) {
 }
 
 function searchAll(meta) {
-  return Promise.all(buildQueries(meta).map(searchAkwam)).then(function (groups) {
+  /* pooled instead of firing every query at once: bursts get throttled and cause timeouts */
+  return mapPool(buildQueries(meta), SEARCH_CONCURRENCY, function (q) { return searchAkwam(q); }).then(function (groups) {
     var map = {}, out = [];
     groups.forEach(function (g) {
       g.forEach(function (r) {
@@ -545,7 +593,9 @@ function pickSeries(results, meta, wantSeason) {
     });
     ok.sort(function (a, b) {
       var ae = a.season === wantSeason ? 1 : 0, be = b.season === wantSeason ? 1 : 0;
-      return (b.score - a.score) || (be - ae) || (a.i - b.i);
+      /* equal score + season: prefer the page whose year is closest to TMDB's */
+      return (b.score - a.score) || (be - ae) ||
+        (yearDiff(a.year, meta.year) - yearDiff(b.year, meta.year)) || (a.i - b.i);
     });
     return ok[0] || null;
   });
@@ -671,6 +721,15 @@ function hostOf(url) {
   return m ? m[1].toLowerCase() : String(url || "");
 }
 
+/* same file = same host + same file name (query strings / tokens ignored when there is a clean path) */
+function mediaKey(url) {
+  var m = String(url || "").match(/^(https?:\/\/[^\/?#]+)(?:\/[^?#]*)?\/([^\/?#]+)$/i);
+  if (!m) return String(url || "");
+  var name = m[2];
+  try { name = decodeURIComponent(name); } catch (e) {}
+  return m[1].toLowerCase() + "|" + name.toLowerCase();
+}
+
 function normalizeMediaUrl(u) {
   u = decodeHtml(u).trim();
   if (!u || /^(javascript|data|blob):/i.test(u)) return "";
@@ -706,33 +765,299 @@ function extractSources(html) {
   return streams;
 }
 
-function finalizeStreams(sources) {
-  var out = [], seen = {};
-  sources.forEach(function (s) {
-    var tier = qualityTier(s.quality);
-    var label = tier.label || "Unknown";
-    var key = label === "Unknown" ? s.url : hostOf(s.url) + "|" + label;
-    if (seen[key]) return;
-    seen[key] = 1;
-    out.push({
-      name: "Akwam",
-      title: label === "Unknown" ? "Akwam" : "Akwam " + label,
-      url: s.url,
-      quality: label,
-      headers: { "User-Agent": UA, "Referer": s.referer || (BASE + "/") },
-      provider: "akwam",
-      _rank: tier.rank
+/* ------------------------------------------------------------------ */
+/* Playback probing: find the streams that will actually play smoothly */
+/* ------------------------------------------------------------------ */
+
+/* higher = better */
+var CLS = { DEAD: 0, SLOW: 1, UNKNOWN: 2, MARGINAL: 3, SAFE: 4 };
+
+/* typical bytes/s of a file when its real size is unknown */
+var EST_BPS = {
+  "2160p": 1800000, "1440p": 900000, "1080p": 650000, "720p": 320000,
+  "Auto": 320000, "480p": 160000, "360p": 100000, "240p": 60000
+};
+
+function headerOf(r, name) {
+  try { return (r && r.headers && r.headers.get && r.headers.get(name)) || ""; } catch (e) { return ""; }
+}
+
+function makeAbort() {
+  try { if (typeof AbortController === "function") return new AbortController(); } catch (e) {}
+  return null;
+}
+
+function safeAbort(c) {
+  try { if (c) c.abort(); } catch (e) {}
+}
+
+/* One probe of one URL. Never rejects.
+   Step 1: 1-byte ranged request  -> is it media, does it support Range, total size, latency.
+   Step 2: PROBE_BYTES ranged GET -> throughput (latency is subtracted so fast servers are not penalised). */
+function probeUrl(url, referer) {
+  var res = {
+    ok: false, bad: false, status: 0, isMp4: false, isHls: false, noRange: false,
+    timedOut: false, speed: 0, ttfb: 0, bytes: 0, finalUrl: url, error: ""
+  };
+  var hlsUrl = /\.m3u8(?:[?#]|$)/i.test(url);
+  var ctrl = makeAbort();
+  var t2 = 0, phase1Done = false;
+
+  function req(rangeTo) {
+    var headers = { "User-Agent": UA, "Accept": "*/*", "Referer": encodeNonAscii(referer || (BASE + "/")) };
+    if (rangeTo != null) headers["Range"] = "bytes=0-" + rangeTo;
+    var opts = { headers: headers, redirect: "follow" };
+    if (ctrl) opts.signal = ctrl.signal;
+    return fetch(encodeNonAscii(url), opts);
+  }
+
+  var job = Promise.resolve().then(function () {
+    var t1 = Date.now();
+    return req(hlsUrl ? null : 0).then(function (r) {
+      res.status = r.status;
+      res.ttfb = Date.now() - t1;
+      res.finalUrl = r.url || url;
+      var ct = headerOf(r, "content-type").toLowerCase();
+      if (r.status >= 400) { res.bad = true; res.error = "HTTP " + r.status; return res; }
+
+      if (hlsUrl || ct.indexOf("mpegurl") !== -1) {
+        return r.text().then(function (txt) {
+          res.isHls = /^\s*#EXTM3U/.test(txt || "");
+          res.ok = res.isHls;
+          if (!res.isHls) { res.bad = true; res.error = "not a playlist"; }
+          return res;
+        });
+      }
+      if (/^(?:text\/|image\/|application\/(?:json|xml|xhtml))/.test(ct)) {
+        res.bad = true; res.error = "not media (" + ct + ")";
+        return res;
+      }
+      res.isMp4 = true;
+      if (r.status !== 206) {
+        /* server ignores Range: we cannot sample without downloading the whole file */
+        res.noRange = true;
+        res.bytes = Number(headerOf(r, "content-length")) || 0;
+        res.ok = true;
+        safeAbort(ctrl);
+        return res;
+      }
+      var cm = /\/(\d+)\s*$/.exec(headerOf(r, "content-range"));
+      res.bytes = cm ? Number(cm[1]) : 0;
+      return r.arrayBuffer().then(function () {
+        phase1Done = true;
+        res.ok = true;
+        t2 = Date.now();
+        return req(PROBE_BYTES - 1).then(function (r2) {
+          if (r2.status !== 206) { safeAbort(ctrl); return res; }
+          return r2.arrayBuffer().then(function (buf) {
+            var n = buf ? buf.byteLength : 0;
+            var T = Date.now() - t2;
+            if (n > 0) {
+              /* the connection is warm now, so only about half of the step-1 latency is still in T */
+              var xfer = Math.max(T - 0.5 * res.ttfb, T * 0.25, 40) / 1000;
+              res.speed = n / xfer;
+            }
+            return res;
+          });
+        });
+      });
     });
   });
-  out.sort(function (a, b) { return b._rank - a._rank; });
-  out.forEach(function (s) { delete s._rank; });
+
+  return new Promise(function (resolve) {
+    var done = false, timer = null;
+    function finish() {
+      if (done) return;
+      done = true;
+      if (timer) { try { clearTimeout(timer); } catch (e) {} }
+      resolve(res);
+    }
+    if (typeof setTimeout === "function") {
+      timer = setTimeout(function () {
+        if (done) return;
+        res.timedOut = true;
+        res.error = res.error || "timeout";
+        if (phase1Done && !res.bad) {
+          /* reachable but the sample did not arrive in time: it is slow, not dead */
+          var el = Math.max(Date.now() - t2, 1000);
+          res.ok = true;
+          res.speed = 0.5 * PROBE_BYTES / (el / 1000);
+        }
+        safeAbort(ctrl);
+        finish();
+      }, PROBE_TIMEOUT_MS);
+    }
+    job.then(finish, function (err) {
+      res.error = String(err && err.message || err);
+      finish();
+    });
+  });
+}
+
+/* probe https; if it is broken or slow, try the same file over http and keep it if it is clearly better */
+function probeOne(s) {
+  var ref = s.referer || (BASE + "/");
+  return probeUrl(s.url, ref).then(function (p) {
+    var isHttps = /^https:/i.test(s.url);
+    var weak = !p.ok || p.bad || (p.speed > 0 && p.speed < HTTP_RETRY_BELOW_BPS);
+    if (!TRY_HTTP_FALLBACK || !isHttps || !weak) return p;
+    var httpUrl = "http:" + s.url.slice(6);
+    return probeUrl(httpUrl, ref).then(function (h) {
+      var stayedHttp = !/^https:/i.test(h.finalUrl || "");
+      var better = h.ok && !h.bad && stayedHttp && (!p.ok || p.bad || h.speed >= p.speed * 1.3);
+      if (better) { h.httpUrl = httpUrl; return h; }
+      return p;
+    }, function () { return p; });
+  });
+}
+
+/* how comfortably will this stream play?  returns { bps, bytes, speed, ratio, startup, cls } */
+function judgeStream(s, p, runtimeMin) {
+  var tier = qualityTier(s.quality);
+  var secs = (Number(runtimeMin) > 0 ? Number(runtimeMin) : 0) * 60;
+  var bytes = (p && p.bytes) || 0;
+  var bps = (bytes && secs) ? bytes / secs : (EST_BPS[tier.label] || 300000);
+  bps = Math.max(bps, 40000);
+  var speed = (p && p.speed) || 0;
+  var ratio = speed ? Math.min(speed / bps, 99) : 0;
+  var startup = speed ? (p.ttfb / 1000) + (bps * BUFFER_SECONDS) / speed : Infinity;
+  var cls;
+  if (!p) cls = CLS.UNKNOWN;
+  else if (p.bad || !p.ok) cls = CLS.DEAD;
+  else if (p.isHls) cls = p.ttfb < 3000 ? CLS.SAFE : CLS.UNKNOWN;     /* HLS adapts its own bitrate */
+  else if (!speed) cls = CLS.UNKNOWN;
+  else if (ratio >= SAFE_RATIO && startup <= MAX_STARTUP_S) cls = CLS.SAFE;
+  else if (ratio >= MARGINAL_RATIO) cls = CLS.MARGINAL;
+  else cls = CLS.SLOW;
+  return { bps: bps, bytes: bytes, speed: speed, ratio: ratio, startup: startup, cls: cls };
+}
+
+function streamObject(src) {
+  var tier = qualityTier(src.quality);
+  var label = tier.label || "Unknown";
+  var bytes = (src.probe && src.probe.bytes) || 0;
+  var item = {
+    name: "Akwam",
+    title: label === "Unknown" ? "Akwam" : "Akwam " + label,
+    url: src.url,
+    quality: label,
+    headers: { "User-Agent": UA, "Referer": src.referer || (BASE + "/") },
+    provider: "akwam",
+    behaviorHints: { notWebReady: true }
+  };
+  if (bytes) {
+    item.bytes = bytes;
+    item.size = bytes;
+    item.behaviorHints.videoSize = bytes;
+  }
+  return item;
+}
+
+/* drop exact duplicates (same file listed on several watch pages) */
+function dedupeSources(sources) {
+  var out = [], byKey = {};
+  sources.forEach(function (s) {
+    if (!s || !s.url) return;
+    var label = qualityTier(s.quality).label;
+    var k = mediaKey(s.url) + "|" + (label || "?");
+    var prev = byKey[k];
+    if (!prev) { byKey[k] = s; out.push(s); }
+    else if (!qualityTier(prev.quality).label && label) prev.quality = s.quality;
+  });
   return out;
 }
 
-function collectStreams(html, pageUrl) {
+/* one entry per host + quality (first = best), converted to final stream objects */
+function toStreams(list) {
+  var out = [], seen = {};
+  list.forEach(function (s) {
+    var label = qualityTier(s.quality).label;
+    var key = label ? hostOf(s.url) + "|" + label : s.url;
+    if (seen[key]) return;
+    seen[key] = 1;
+    out.push(streamObject(s));
+  });
+  return out;
+}
+
+function byQuality(a, b) {
+  return (qualityTier(b.quality).rank - qualityTier(a.quality).rank) || (a._i - b._i);
+}
+
+/* no probing: plain quality order (used as a fallback) */
+function finalizeStreams(sources) {
+  var uniq = dedupeSources(sources);
+  uniq.forEach(function (s, i) { s._i = i; });
+  uniq.sort(byQuality);
+  return toStreams(uniq);
+}
+
+/* speed-test the sources and order them so the first one is the best that will not stall */
+function rankForPlayback(sources, runtimeMin) {
+  var uniq = dedupeSources(sources);
+  if (!uniq.length) return Promise.resolve([]);
+  uniq.forEach(function (s, i) { s._i = i; });
+  uniq.sort(byQuality);
+
+  var head = uniq.slice(0, MAX_PROBES);
+  var finished = false;
+  var timer = null;
+
+  var work = mapPool(head, PROBE_CONCURRENCY, function (s) {
+    return probeOne(s).then(function (p) {
+      if (finished) return s;
+      s.probe = p;
+      if (p.httpUrl && (p.isMp4 || p.isHls)) s.url = p.httpUrl;
+      s.judge = judgeStream(s, p, runtimeMin);
+      var j = s.judge;
+      log("Probe", (qualityTier(s.quality).label || s.quality),
+        (p.speed ? Math.round(p.speed / 1024) : 0) + "KB/s",
+        "need", Math.round(j.bps / 1024) + "KB/s",
+        "start", isFinite(j.startup) ? j.startup.toFixed(1) + "s" : "?",
+        "x" + (j.ratio ? j.ratio.toFixed(2) : "0"),
+        p.httpUrl ? "http-fixed" : "https",
+        (p.isHls ? "hls" : (p.isMp4 ? "mp4" : "bad")),
+        p.error ? "(" + p.error + ")" : "");
+      return s;
+    }).catch(function () { return s; });
+  });
+
+  var budget = new Promise(function (resolve) {
+    if (typeof setTimeout === "function") timer = setTimeout(resolve, PROBE_BUDGET_MS);
+  });
+
+  return Promise.race([work, budget]).then(function () {
+    finished = true;
+    if (timer) { try { clearTimeout(timer); } catch (e) {} }
+
+    /* anything that was not probed in time is simply "unknown" */
+    uniq.forEach(function (s) {
+      if (!s.judge) s.judge = judgeStream(s, s.probe || null, runtimeMin);
+    });
+
+    /* links that are certainly not playable go away, but never leave the person with nothing */
+    var live = uniq.filter(function (s) { return !(s.probe && s.probe.bad); });
+    var list = live.length ? live : uniq;
+
+    list.sort(function (a, b) {
+      var ja = a.judge, jb = b.judge;
+      if (ja.cls !== jb.cls) return jb.cls - ja.cls;
+      if (ja.cls <= CLS.SLOW) {
+        /* nothing comfortable in this group: least bad first */
+        return (jb.ratio - ja.ratio) || byQuality(a, b);
+      }
+      /* same comfort level: best quality first, then the faster one */
+      return (qualityTier(b.quality).rank - qualityTier(a.quality).rank) || (jb.ratio - ja.ratio) || (a._i - b._i);
+    });
+
+    return toStreams(list);
+  });
+}
+
+function collectStreams(html, pageUrl, runtimeMin) {
   var watchUrls = extractWatchUrls(html);
   log("Watch pages:", watchUrls.length);
-  return Promise.all(watchUrls.map(function (w) {
+  return mapPool(watchUrls, WATCH_CONCURRENCY, function (w) {
     return fetchText(w, pageUrl).then(function (wh) {
       var src = extractSources(wh);
       src.forEach(function (s) { s.referer = w; });
@@ -741,10 +1066,15 @@ function collectStreams(html, pageUrl) {
       log("Watch page failed:", w, err && err.message);
       return [];
     });
-  })).then(function (groups) {
+  }).then(function (groups) {
     var all = [];
     groups.forEach(function (g) { g.forEach(function (s) { all.push(s); }); });
-    return { watchCount: watchUrls.length, streams: finalizeStreams(all) };
+    return rankForPlayback(all, runtimeMin).catch(function (err) {
+      log("Ranking failed, using quality order:", err && err.message);
+      return finalizeStreams(all);
+    });
+  }).then(function (streams) {
+    return { watchCount: watchUrls.length, streams: streams };
   });
 }
 
@@ -767,7 +1097,7 @@ function resolve(tmdbId, mediaType, season, episode) {
       out.picked = { url: picked.page.url, title: picked.title, score: picked.score, year: picked.year, season: picked.season };
       log("SELECTED:", picked.title, picked.page.url, "score:", picked.score.toFixed(2));
       if (!isTv) {
-        return collectStreams(picked.page.html, picked.page.url).then(function (r) {
+        return collectStreams(picked.page.html, picked.page.url, meta.runtime).then(function (r) {
           out.watchCount = r.watchCount; out.streams = r.streams;
           if (!r.streams.length) out.reason = r.watchCount ? "NO_LINKS" : "NO_WATCH_PAGES";
           return out;
@@ -779,7 +1109,7 @@ function resolve(tmdbId, mediaType, season, episode) {
       if (!ep) { out.reason = "NO_EPISODE"; return out; }
       out.episodeUrl = ep.url;
       return fetchText(ep.url, picked.page.url).then(function (epHtml) {
-        return collectStreams(epHtml, ep.url);
+        return collectStreams(epHtml, ep.url, meta.runtime);
       }).then(function (r) {
         out.watchCount = r.watchCount; out.streams = r.streams;
         if (!r.streams.length) out.reason = r.watchCount ? "NO_LINKS" : "NO_WATCH_PAGES";
@@ -812,6 +1142,13 @@ module.exports = {
     pickEpisode: pickEpisode,
     extractSources: extractSources,
     finalizeStreams: finalizeStreams,
-    buildQueries: buildQueries
+    buildQueries: buildQueries,
+    mediaKey: mediaKey,
+    mapPool: mapPool,
+    probeUrl: probeUrl,
+    probeOne: probeOne,
+    judgeStream: judgeStream,
+    streamObject: streamObject,
+    rankForPlayback: rankForPlayback
   }
 };
