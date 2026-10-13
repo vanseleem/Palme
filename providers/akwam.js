@@ -1,13 +1,19 @@
 var BASE = "https://akwam.ss";
 var UA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Mobile Safari/537.36";
 var TMDB_API_KEY = "83d364331c40bfbe29858aeed82f45cc";
-var MAX_SERVERS = 3;
+var MAX_SERVERS = 4;               /* one watch page per quality (1080p / 720p / 480p / ...) */
 var MAX_CANDIDATE_PAGES = 4;
 var MAX_QUERIES = 6;
 var FETCH_TIMEOUT_MS = 8000;
 /* First wave is the English title + the Arabic title. Extra alternate titles
    only run when that wave did not already find an obvious match. */
 var FIRST_QUERY_WAVE = 2;
+/* Akwam search lists NEWEST FIRST, 25 per page, so older titles (Friends, Psycho ...)
+   sit on page 2+. Pages are fetched one level at a time, only until a match is accepted. */
+var MAX_SEARCH_PAGES = 4;
+var SEARCH_CONCURRENCY = 4;
+/* after the first watch page returns links, wait at most this long for the other qualities */
+var WATCH_GRACE_MS = 1500;
 
 function log() {
   try {
@@ -355,25 +361,10 @@ function getMeta(tmdbId, mediaType) {
     var dateStr = isMovie ? d.release_date : d.first_air_date;
     var year = dateStr ? Number(String(dateStr).slice(0, 4)) : null;
     if (!titles.length) throw new Error("No usable TMDB titles for " + tmdbId);
-
-    /* runtime in minutes: lets us work out the bitrate a file needs, to judge if it will stall */
-    var runtime = 0;
-    if (isMovie) {
-      runtime = Number((en && en.runtime) || (ar && ar.runtime)) || 0;
-    } else {
-      runtime = Number(
-        (en && en.episode_run_time && en.episode_run_time[0]) ||
-        (ar && ar.episode_run_time && ar.episode_run_time[0]) ||
-        (en && en.last_episode_to_air && en.last_episode_to_air.runtime) ||
-        (ar && ar.last_episode_to_air && ar.last_episode_to_air.runtime)
-      ) || 0;
-    }
-    if (!(runtime > 0)) runtime = isMovie ? 105 : 45;
-
-    log("TMDB titles:", titles.join(" | "), "year:", year || "?", "runtime:", runtime + "m");
+    log("TMDB titles:", titles.join(" | "), "year:", year || "?");
     var oc = (!isMovie && d.origin_country && d.origin_country[0]) ? String(d.origin_country[0]).toUpperCase() : "";
     var dropTokens = oc === "US" ? makeSet("us usa") : (oc === "GB" ? makeSet("uk") : null);
-    return { titles: titles, year: year, title: titles[0], isMovie: isMovie, dropTokens: dropTokens, runtime: runtime };
+    return { titles: titles, year: year, title: titles[0], isMovie: isMovie, dropTokens: dropTokens, cache: {} };
   });
 }
 
@@ -445,66 +436,87 @@ function extractSearchResults(html) {
   return order;
 }
 
-function searchAkwam(query) {
-  var url = BASE + "/search?q=" + encodeURIComponent(query);
+/* highest page number the pager links to ("search?q=X&page=2" or "search?q=X&amp;page=2") */
+function lastPageOf(html) {
+  var max = 1, m, re = /\/search\?[^"'\s]*?\bpage=(\d+)/gi;
+  while ((m = re.exec(html)) !== null) {
+    var n = Number(m[1]);
+    if (n > max && n < 200) max = n;
+  }
+  return max;
+}
+
+function searchAkwam(query, page) {
+  page = page || 1;
+  var url = BASE + "/search?q=" + encodeURIComponent(query) + (page > 1 ? "&page=" + page : "");
   log("Search:", url);
   return fetchText(url, BASE + "/").then(function (html) {
     var results = extractSearchResults(html);
-    log("Search results for", query + ":", results.length);
-    return results;
+    var last = lastPageOf(html);
+    log("Search results for", query + " (p" + page + "/" + last + "):", results.length);
+    return { results: results, lastPage: last };
   }).catch(function (err) {
-    log("Search failed:", query, err && err.message);
-    return [];
+    log("Search failed:", query, "p" + page, err && err.message);
+    return { results: [], lastPage: page };
   });
 }
 
-function searchAll(meta, isTv) {
+/* Search in levels. Level 1 = page 1 of the two main titles. If nothing is accepted, level 2 =
+   page 2 of those + page 1 of the alternate titles, and so on (max MAX_SEARCH_PAGES).
+   After every level the real accept test runs, so we stop as soon as the right page is found.
+   Loose fuzzy matching is only allowed on the last level. */
+function findMatch(meta, isTv, wantSeason) {
   var queries = buildQueries(meta);
-  var map = {}, out = [];
+  var map = {}, all = [], lastPage = {};
+
   function absorb(group) {
     (group || []).forEach(function (r) {
       var k = r.kind + "/" + r.key;
-      if (!map[k]) { map[k] = r; out.push(r); }
+      if (!map[k]) { map[k] = r; all.push(r); }
       else if (map[k].weak && !r.weak) { map[k].title = r.title; map[k].weak = false; }
     });
   }
-  function bestScore() {
-    var best = 0;
-    out.forEach(function (r) {
-      if (isTv && r.kind !== "series") return;
-      if (!isTv && r.kind !== "movie") return;
-      var s = scoreTitle(r.title, meta.titles, !isTv, meta.dropTokens).score;
-      if (s > best) best = s;
+
+  function tasksFor(level) {
+    var tasks = [];
+    queries.forEach(function (q, qi) {
+      var page = qi < FIRST_QUERY_WAVE ? level : level - 1;
+      if (page < 1 || page > MAX_SEARCH_PAGES) return;
+      if (page > 1 && !(lastPage[qi] >= page)) return;
+      tasks.push({ qi: qi, q: q, page: page });
     });
-    return best;
+    return tasks;
   }
-  function run(list) {
-    if (!list.length) return Promise.resolve(out);
-    return mapPool(list, list.length, function (q) { return searchAkwam(q); }).then(function (groups) {
-      groups.forEach(absorb);
-      return out;
+
+  function step(level) {
+    var tasks = tasksFor(level);
+    if (!tasks.length) return Promise.resolve(null);
+    return mapPool(tasks, SEARCH_CONCURRENCY, function (t) {
+      return searchAkwam(t.q, t.page).then(function (r) {
+        lastPage[t.qi] = Math.max(lastPage[t.qi] || 0, r.lastPage);
+        absorb(r.results);
+        return r;
+      });
+    }).then(function () {
+      var more = level < MAX_SEARCH_PAGES && tasksFor(level + 1).length > 0;
+      var pick = isTv ? pickSeries(all, meta, wantSeason, !more) : pickMovie(all, meta, !more);
+      return pick.then(function (picked) {
+        log("Search level", level, "candidates:", all.length, picked ? "-> match" : (more ? "-> deeper" : "-> none"));
+        if (picked || !more) return picked;
+        return step(level + 1);
+      });
     });
   }
-  var first = queries.slice(0, FIRST_QUERY_WAVE);
-  var rest = queries.slice(FIRST_QUERY_WAVE);
-  return run(first).then(function () {
-    /* identical / same-token hit: do not wait on extra alternate-title searches */
-    if (!rest.length || bestScore() >= 0.97) {
-      log("Unique candidates:", out.length);
-      return out;
-    }
-    return run(rest).then(function () {
-      log("Unique candidates:", out.length);
-      return out;
-    });
-  });
+
+  return step(1);
 }
 
 /* ------------------------------------------------------------------ */
 /* Candidate pages                                                     */
 /* ------------------------------------------------------------------ */
 
-var YEAR_LABEL_RE = /(?:سنة\s*الإنتاج|سنة\s*الانتاج|سنة\s*الاصدار|سنة\s*الإصدار|تاريخ\s*الإصدار|تاريخ\s*الاصدار|تاريخ\s*العرض|release\s*date)[\s\S]{0,120}?\b((?:19|20)\d{2})\b/i;
+/* "السنة : 1960" is what movie / season / episode pages use */
+var YEAR_LABEL_RE = /(?:السنة|سنة\s*(?:الإنتاج|الانتاج|الاصدار|الإصدار)|تاريخ\s*(?:الإصدار|الاصدار|العرض)|release\s*date)[\s\S]{0,100}?\b((?:19|20)\d{2})\b/i;
 
 function parsePage(url, html) {
   var h = html.match(/<h1\b[^>]*class=["'][^"']*entry-title[^"']*["'][^>]*>([\s\S]*?)<\/h1>/i) ||
@@ -519,9 +531,18 @@ function parsePage(url, html) {
   };
 }
 
+/* every candidate page is downloaded once per lookup, even when several search levels see it */
+function getPage(url, meta) {
+  var cache = meta.cache || (meta.cache = {});
+  if (!cache[url]) {
+    cache[url] = fetchText(url, BASE + "/").then(function (html) { return parsePage(url, html); });
+    cache[url].catch(function () { delete cache[url]; });
+  }
+  return cache[url];
+}
+
 function loadCandidate(x, meta, isMovie) {
-  return fetchText(x.r.url, BASE + "/").then(function (html) {
-    var page = parsePage(x.r.url, html);
+  return getPage(x.r.url, meta).then(function (page) {
     var ps = page.title ? scoreTitle(page.title, meta.titles, isMovie, meta.dropTokens) : { score: 0, year: null, season: null };
     var card = x.s || { score: 0, year: null, season: null };
     return {
@@ -544,21 +565,26 @@ function yearDiff(a, b) { return (a && b) ? Math.abs(Number(a) - Number(b)) : 99
 
 function movieAccept(score, year, metaYear) {
   if (score < 0.8) return false;
-  if (year && metaYear) return yearDiff(year, metaYear) <= 1;
+  if (year && metaYear) {
+    var d = yearDiff(year, metaYear);
+    /* same title, years a bit apart: still the same film when the title matches exactly */
+    return d <= 1 || (d <= 3 && score >= 0.97);
+  }
   return score >= 0.97;
 }
 
-function pickMovie(results, meta) {
+function pickMovie(results, meta, allowLoose) {
   var list = results.filter(function (r) { return r.kind === "movie"; });
   var scored = list.map(function (r, i) { return { r: r, i: i, s: scoreTitle(r.title, meta.titles, true) }; });
   var cands = scored.filter(function (x) { return x.s.score >= 0.8; }).sort(cmpScore).slice(0, MAX_CANDIDATE_PAGES);
-  if (!cands.length) {
+  if (!cands.length && allowLoose) {
     /* card titles can be truncated: confirm the closest few on their real page title */
     cands = scored.map(function (x) { x.loose = looseOverlap(x.r.title, meta.titles); return x; })
       .filter(function (x) { return x.loose >= 0.3; })
       .sort(function (a, b) { return (b.loose - a.loose) || (a.i - b.i); })
       .slice(0, 3);
   }
+  if (!cands.length) return Promise.resolve(null);
   return Promise.all(cands.map(function (x) { return loadCandidate(x, meta, true); })).then(function (loaded) {
     var ok = loaded.filter(function (c) {
       if (!c) return false;
@@ -585,7 +611,7 @@ function seriesAccept(c, meta, wantSeason) {
   return true;
 }
 
-function pickSeries(results, meta, wantSeason) {
+function pickSeries(results, meta, wantSeason, allowLoose) {
   var list = results.filter(function (r) { return r.kind === "series"; });
   var scored = list.map(function (r, i) { return { r: r, i: i, s: scoreTitle(r.title, meta.titles, false, meta.dropTokens) }; });
   var plausible = scored.filter(function (x) { return x.s.score >= 0.9; });
@@ -593,12 +619,13 @@ function pickSeries(results, meta, wantSeason) {
   var unnumbered = plausible.filter(function (x) { return x.s.season == null; }).sort(cmpScore);
   var cands = exact.length ? exact.slice(0, MAX_CANDIDATE_PAGES)
     : unnumbered.slice(0, wantSeason === 1 ? MAX_CANDIDATE_PAGES : 2);
-  if (!cands.length) {
+  if (!cands.length && allowLoose) {
     cands = scored.map(function (x) { x.loose = looseOverlap(x.r.title, meta.titles); return x; })
       .filter(function (x) { return x.loose >= 0.3 && (x.s.season == null || x.s.season === wantSeason); })
       .sort(function (a, b) { return (b.loose - a.loose) || (a.i - b.i); })
       .slice(0, 3);
   }
+  if (!cands.length) return Promise.resolve(null);
   return Promise.all(cands.map(function (x) { return loadCandidate(x, meta, false); })).then(function (loaded) {
     var ok = loaded.filter(function (c) {
       if (!c) return false;
@@ -775,7 +802,7 @@ function extractSources(html) {
     if (!url || seen[url]) return;
     seen[url] = 1;
     if (!quality) {
-      var qm = url.match(/(?:^|[^0-9])(2160|1440|1080|720|480|360|240)p?(?:[^0-9]|$)/);
+      var qm = url.match(/(?:^|[^0-9])(2160|1440|1080|720|480|360|240)p?(?:[^0-9]|$)/i);
       quality = qm ? qm[1] : "";
     }
     streams.push({ url: url, quality: quality || "Unknown" });
@@ -792,6 +819,9 @@ function extractSources(html) {
   while ((vm = vre.exec(html)) !== null) push(vm[1], "");
   var fre = /["']?file["']?\s*:\s*["']([^"']+\.(?:mp4|m3u8)[^"']*)["']/gi, fm;
   while ((fm = fre.exec(html)) !== null) push(fm[1], "");
+  /* the page also prints the direct file link (used by its VLC / MX Player buttons) */
+  var dre = /href=["'](https?:\/\/[^"']+\.(?:mp4|m3u8|mkv)(?:\?[^"']*)?)["']/gi, dm;
+  while ((dm = dre.exec(html)) !== null) push(dm[1], "");
   return streams;
 }
 
@@ -823,7 +853,6 @@ function streamObject(src) {
   var headers = { "User-Agent": UA, "Referer": referer };
   var title = label === "Unknown" ? "Akwam" : "Akwam " + label;
   if (src.prettySize) title += " \u00b7 " + src.prettySize;
-  var responseType = hls ? "application/vnd.apple.mpegurl" : "video/mp4";
   return {
     name: "Akwam",
     title: title,
@@ -835,13 +864,7 @@ function streamObject(src) {
     behaviorHints: {
       notWebReady: true,
       bingeGroup: "akwam-" + label,
-      proxyHeaders: {
-        request: headers,
-        response: {
-          "Content-Type": responseType,
-          "Content-Disposition": "inline"
-        }
-      }
+      proxyHeaders: { request: headers }
     }
   };
 }
@@ -884,14 +907,20 @@ function finalizeStreams(sources) {
   return toStreams(uniq);
 }
 
-/* sizes printed on the watch page, in the same order as the quality tabs */
-function extractSizeMap(html) {
-  var labels = [], sizes = [], m, t;
-  var reL = /<a\b[^>]*href=["']#tab-\d+["'][^>]*>([\s\S]*?)<\/a>/gi;
-  while ((m = reL.exec(html)) !== null) {
+/* quality tabs on a title/episode page, in order: [1080p, 720p, 480p] */
+function tabLabels(html) {
+  var labels = [], m, t;
+  var re = /<a\b[^>]*href=["']#tab-\d+["'][^>]*>([\s\S]*?)<\/a>/gi;
+  while ((m = re.exec(html)) !== null) {
     t = stripHtml(m[1]);
     if (t) labels.push(t);
   }
+  return labels;
+}
+
+/* sizes printed on the page, in the same order as the quality tabs */
+function extractSizeMap(html) {
+  var labels = tabLabels(html), sizes = [], m, t;
   var reS = /class=["'][^"']*font-size-14[^"']*["'][^>]*>([\s\S]*?)</gi;
   while ((m = reS.exec(html)) !== null) {
     t = stripHtml(m[1]);
@@ -906,32 +935,60 @@ function extractSizeMap(html) {
   return map;
 }
 
-/* One watch page already lists every quality. Fetching the rest, and speed-testing
-   the files, only delays the link and (on Nuvio) keeps downloading the movie in
-   the background because Range/abort are not honoured. */
+/* The title / episode page lists one watch page PER QUALITY (tabs: 1080p, 720p, 480p, in the same
+   order as the watch links) and each watch page only plays its own quality. So the first page
+   alone would give just 1080p (the biggest file) - fetch them all in parallel, and don't wait
+   long for stragglers once something is available. */
 function collectStreams(html, pageUrl) {
-  var watchUrls = extractWatchUrls(html).slice(0, MAX_SERVERS);
-  log("Watch pages:", watchUrls.length);
-  function tryAt(i) {
-    if (i >= watchUrls.length) return Promise.resolve({ watchCount: watchUrls.length, streams: [] });
-    var w = watchUrls[i];
-    return fetchText(w, pageUrl).then(function (wh) {
-      var src = extractSources(wh);
-      if (!src.length) return tryAt(i + 1);
-      var sizes = extractSizeMap(wh);
-      src.forEach(function (s) {
-        s.referer = w;
-        var label = qualityTier(s.quality).label;
-        if (label && sizes[label]) s.prettySize = sizes[label];
+  var urls = extractWatchUrls(html);
+  var labels = tabLabels(html);
+  var sizes = extractSizeMap(html);
+  log("Watch pages:", urls.length, "tabs:", labels.join(","));
+  if (!urls.length) return Promise.resolve({ watchCount: 0, streams: [] });
+
+  return new Promise(function (resolve) {
+    var found = [], pending = urls.length, finished = false, grace = null;
+    function done() {
+      if (finished) return;
+      finished = true;
+      if (grace) { try { clearTimeout(grace); } catch (e) {} }
+      var streams = finalizeStreams(found);
+      log("Sources:", found.length, "streams:", streams.map(function (s) { return s.quality; }).join(","));
+      resolve({ watchCount: urls.length, streams: streams });
+    }
+    function distinctQualities() {
+      var seen = {}, n = 0;
+      found.forEach(function (s) {
+        var l = qualityTier(s.quality).label || s.url;
+        if (!seen[l]) { seen[l] = 1; n++; }
       });
-      log("Sources:", src.length);
-      return { watchCount: i + 1, streams: finalizeStreams(src) };
-    }).catch(function (err) {
-      log("Watch page failed:", w, err && err.message);
-      return tryAt(i + 1);
+      return n;
+    }
+    urls.forEach(function (w, idx) {
+      fetchText(w, pageUrl).then(function (wh) {
+        var src = extractSources(wh);
+        var pageSizes = extractSizeMap(wh);
+        src.forEach(function (s) {
+          s.referer = w;
+          /* quality from the tab that points at this watch page, if the file itself does not say */
+          if (!qualityTier(s.quality).label && labels[idx]) s.quality = labels[idx];
+          var label = qualityTier(s.quality).label;
+          var size = label && (sizes[label] || pageSizes[label]);
+          if (size) s.prettySize = size;
+          found.push(s);
+        });
+        if (src.length) {
+          if (distinctQualities() >= urls.length) return done();
+          if (!grace && typeof setTimeout === "function") grace = setTimeout(done, WATCH_GRACE_MS);
+        }
+      }).catch(function (err) {
+        log("Watch page failed:", w, err && err.message);
+      }).then(function () {
+        pending--;
+        if (pending <= 0) done();
+      });
     });
-  }
-  return tryAt(0);
+  });
 }
 
 /* ------------------------------------------------------------------ */
@@ -946,11 +1003,8 @@ function resolve(tmdbId, mediaType, season, episode) {
   var started = Date.now();
   return getMeta(tmdbId, isTv ? "tv" : "movie").then(function (meta) {
     out.meta = meta;
-    return searchAll(meta, isTv).then(function (results) {
-      out.candidates = results.length;
-      return isTv ? pickSeries(results, meta, wantSeason) : pickMovie(results, meta);
-    }).then(function (picked) {
-      if (!picked) { out.reason = "NO_MATCH"; return out; }
+    return findMatch(meta, isTv, wantSeason).then(function (picked) {
+      if (!picked) { out.reason = "NO_MATCH"; out.ms = Date.now() - started; return out; }
       out.picked = { url: picked.page.url, title: picked.title, score: picked.score, year: picked.year, season: picked.season };
       log("SELECTED:", picked.title, picked.page.url, "score:", picked.score.toFixed(2));
       if (!isTv) {
@@ -999,6 +1053,7 @@ if (typeof module !== "undefined" && module.exports) {
       scoreTitle: scoreTitle,
       foldText: foldText,
       extractSearchResults: extractSearchResults,
+      lastPageOf: lastPageOf,
       parseEpisodeLinks: parseEpisodeLinks,
       pickEpisode: pickEpisode,
       extractSources: extractSources,
@@ -1006,7 +1061,8 @@ if (typeof module !== "undefined" && module.exports) {
       buildQueries: buildQueries,
       mediaKey: mediaKey,
       mapPool: mapPool,
-      streamObject: streamObject
+      streamObject: streamObject,
+      parsePage: parsePage
     }
   };
 }
