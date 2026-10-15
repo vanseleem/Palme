@@ -1,7 +1,7 @@
 var BASE = "https://akwam.ss";
 var UA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Mobile Safari/537.36";
 var TMDB_API_KEY = "83d364331c40bfbe29858aeed82f45cc";
-var MAX_SERVERS = 10;
+var MAX_SERVERS = 4;
 var MAX_CANDIDATE_PAGES = 4;
 var MAX_QUERIES = 8;
 var FETCH_TIMEOUT_MS = 12000;
