@@ -2,7 +2,7 @@ var BASE = "https://larozaa.casa";
 var UA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Mobile Safari/537.36";
 var TMDB_API_KEY = "83d364331c40bfbe29858aeed82f45cc";
 
-var MAX_SERVERS = 12;     // how many servers from play.php to resolve
+var MAX_SERVERS = 2;     // how many servers from play.php to resolve
 var REQUEST_TIMEOUT = 10000;
 
 function withTimeout(promise, ms) {
