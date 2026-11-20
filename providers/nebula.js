@@ -1,17 +1,10 @@
 var PROVIDER_ID = "nebula";
 var PROVIDER_NAME = "Nebula";
 
-// API endpoint for vaplayer, which powers the Vortex backend
 var VAPLAYER_API = "https://streamdata.vaplayer.ru/api.php";
+var PLAYER_ORIGIN = "https://nextgencloudfabric.com"; // required origin
 
-// Headers required by the vaplayer API and its CDN (updated to current origin)
-var VAPLAYER_HEADERS = {
-  "Origin": "https://vaplayer.ru",
-  "Referer": "https://vaplayer.ru/",
-  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-};
-
-var UA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Mobile Safari/537.36";
+var UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 var TMDB_API_KEY = "83d364331c40bfbe29858aeed82f45cc";
 
 var FETCH_TIMEOUT_MS = 12000;
@@ -89,7 +82,7 @@ function absUrl(base, rel) {
   return origin + parts.join("/");
 }
 
-// ---------------------------------------------------------------- TMDB
+// ---------------------------------------------------------------- TMDB (optional, only for display title)
 function fetchImdbId(tmdbId, type) {
   var url = "https://api.themoviedb.org/3/" + type + "/" + encodeURIComponent(tmdbId) +
     "?api_key=" + TMDB_API_KEY + "&language=en&append_to_response=external_ids";
@@ -153,61 +146,66 @@ function makeStream(ctx, url, label, rank, headers) {
 }
 
 // ---------------------------------------------------------------- vaplayer API
-function fetchVaplayer(ctx, type, season, episode) {
-  var url = VAPLAYER_API + "?tmdb=" + encodeURIComponent(ctx.tmdbId) + "&type=" + type;
-  if (type === "tv") url += "&season=" + season + "&episode=" + episode;
+function fetchVaplayer(ctx, type, season, episode, imdbId) {
+  // CRITICAL FIX: use imdb=, not tmdb=
+  var params = "imdb=" + encodeURIComponent(imdbId) + "&type=" + type;
+  if (type === "tv") params += "&season=" + season + "&episode=" + episode;
+  var url = VAPLAYER_API + "?" + params;
+
+  // CRITICAL FIX: Origin and Referer must be nextgencloudfabric.com
+  var referer = type === "tv"
+    ? PLAYER_ORIGIN + "/embed/tv/" + imdbId + "/" + season + "/" + episode
+    : PLAYER_ORIGIN + "/embed/movie/" + imdbId;
+
+  var headers = {
+    "Origin": PLAYER_ORIGIN,
+    "Referer": referer,
+    "User-Agent": UA
+  };
+
   log("Vortex API: " + url);
 
-  return request(url, VAPLAYER_HEADERS).then(function(r) {
+  return request(url, headers).then(function(r) {
     log("HTTP " + r.status + " body[0..300]=" + JSON.stringify(r.text.slice(0, 300)));
 
     var data = null;
     try { data = JSON.parse(r.text); } catch (e) { log("JSON parse failed: " + e.message); return []; }
     if (!r.ok) { log("HTTP error " + r.status); return []; }
-    if (data.status_code !== 200) { log("vaplayer status_code=" + data.status_code); return []; }
+
+    // status_code may be returned as string "200" or number 200
+    if (data.status_code !== 200 && data.status_code !== "200") {
+      log("vaplayer status_code=" + data.status_code + " error=" + (data.error || ""));
+      return [];
+    }
     if (!data.data || !Array.isArray(data.data.stream_urls)) {
       log("Unexpected schema; keys=" + Object.keys(data || {}).join(",") +
           (data.data ? " dataKeys=" + Object.keys(data.data).join(",") : ""));
       return [];
     }
 
-    var subs = [];
-    if (Array.isArray(data.default_subs)) {
-      data.default_subs.forEach(function(s) {
-        if (!s || typeof s.url !== "string") return;
-        var lang = s.lang || s.code || "";
-        subs.push({
-          url: s.url,
-          language: String(lang).toLowerCase().slice(0, 12) || "und",
-          name: String(lang || "Subtitle")
-        });
-      });
-    }
-
     // Expand each stream URL to get its quality variants
     var expandPromises = data.data.stream_urls.map(function(u) {
       if (typeof u !== "string" || !/^https?:\/\//i.test(u)) return Promise.resolve([]);
-      return request(u, VAPLAYER_HEADERS).then(function(r) {
+      return request(u, headers).then(function(r) {
         if (!r.ok || r.text.indexOf("#EXTM3U") === -1) {
-          return [makeStream(ctx, u, "Auto", 1000000, VAPLAYER_HEADERS)];
+          return [makeStream(ctx, u, "Auto", 1000000, headers)];
         }
         var master = parseMaster(u, r.text);
         var top = labelFromRes(master.best.w, master.best.h);
         if (master.variants.length < 2 || master.hasSeparateAudio) {
-          return [makeStream(ctx, u, top, 1000000, VAPLAYER_HEADERS)];
+          return [makeStream(ctx, u, top, 1000000, headers)];
         }
-        var out = [makeStream(ctx, u, "Auto", 1000000, VAPLAYER_HEADERS)];
+        var out = [makeStream(ctx, u, "Auto", 1000000, headers)];
         master.variants.forEach(function(v) {
-          out.push(makeStream(ctx, v.url, v.label, rankOf(v.label), VAPLAYER_HEADERS));
+          out.push(makeStream(ctx, v.url, v.label, rankOf(v.label), headers));
         });
         return out;
       }).catch(function() {
-        return [makeStream(ctx, u, "Auto", 1000000, VAPLAYER_HEADERS)];
+        return [makeStream(ctx, u, "Auto", 1000000, headers)];
       });
     });
 
     return Promise.all(expandPromises).then(function(groups) {
-      // Deduplicate by quality label
       var byQuality = {};
       groups.forEach(function(g) {
         g.forEach(function(s) {
@@ -228,24 +226,17 @@ function fetchVaplayer(ctx, type, season, episode) {
 
 // ---------------------------------------------------------------- core
 function getStreamsFor(tmdbId, type, season, episode) {
-  var p2 = pad2;
   var ctx = {
     tmdbId: tmdbId,
-    displayTitle: type === "movie" ? "TMDB " + tmdbId : "TMDB " + tmdbId + " S" + p2(season) + "E" + p2(episode)
+    displayTitle: type === "movie" ? "TMDB " + tmdbId : "TMDB " + tmdbId + " S" + pad2(season) + "E" + pad2(episode)
   };
 
-  // TMDB is optional – it only updates the display title.
-  // If it fails (rate-limit, key issue), we still proceed to vaplayer.
+  // Resolve IMDb first – it is REQUIRED for the API call, not just for the title.
   return fetchImdbId(tmdbId, type)
     .then(function(imdbId) {
       log("IMDb ID: " + imdbId);
       ctx.displayTitle = "IMDb " + imdbId;
-    })
-    .catch(function(err) {
-      log("TMDB skipped, continuing: " + (err && err.message));
-    })
-    .then(function() {
-      return fetchVaplayer(ctx, type, season, episode);
+      return fetchVaplayer(ctx, type, season, episode, imdbId);
     })
     .catch(function(err) {
       log("Error: " + (err && err.message));
@@ -266,9 +257,9 @@ function getStreams(tmdbId, mediaType, seasonNum, episodeNum) {
   });
 }
 
-// ---------------------------------------------------------------- React Native / Hermes compatible export
+// ---------------------------------------------------------------- export
 if (typeof module !== "undefined" && module.exports) {
   module.exports = { getStreams: getStreams };
 } else {
   global.getStreams = getStreams;
-    }
+                           }
