@@ -1,13 +1,13 @@
 var PROVIDER_ID = "nebula";
-var PROVIDER_NAME = "Nebula ";
+var PROVIDER_NAME = "Nebula";
 
 // API endpoint for vaplayer, which powers the Vortex backend
 var VAPLAYER_API = "https://streamdata.vaplayer.ru/api.php";
 
-// Headers required by the vaplayer API and its CDN
+// Headers required by the vaplayer API and its CDN (updated to current origin)
 var VAPLAYER_HEADERS = {
-  "Origin": "https://nextgencloudfabric.com",
-  "Referer": "https://nextgencloudfabric.com/",
+  "Origin": "https://vaplayer.ru",
+  "Referer": "https://vaplayer.ru/",
   "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 };
 
@@ -159,14 +159,18 @@ function fetchVaplayer(ctx, type, season, episode) {
   log("Vortex API: " + url);
 
   return request(url, VAPLAYER_HEADERS).then(function(r) {
+    log("HTTP " + r.status + " body[0..300]=" + JSON.stringify(r.text.slice(0, 300)));
+
     var data = null;
-    try { data = JSON.parse(r.text); } catch (e) { /* not JSON */ }
-    if (!r.ok || !data || data.status_code != 200 || !data.data || !Array.isArray(data.data.stream_urls)) {
-      log("Vortex: no streams (HTTP " + r.status + ")");
+    try { data = JSON.parse(r.text); } catch (e) { log("JSON parse failed: " + e.message); return []; }
+    if (!r.ok) { log("HTTP error " + r.status); return []; }
+    if (data.status_code !== 200) { log("vaplayer status_code=" + data.status_code); return []; }
+    if (!data.data || !Array.isArray(data.data.stream_urls)) {
+      log("Unexpected schema; keys=" + Object.keys(data || {}).join(",") +
+          (data.data ? " dataKeys=" + Object.keys(data.data).join(",") : ""));
       return [];
     }
 
-    var label = labelFromName(data.data.file_name);
     var subs = [];
     if (Array.isArray(data.default_subs)) {
       data.default_subs.forEach(function(s) {
@@ -230,14 +234,23 @@ function getStreamsFor(tmdbId, type, season, episode) {
     displayTitle: type === "movie" ? "TMDB " + tmdbId : "TMDB " + tmdbId + " S" + p2(season) + "E" + p2(episode)
   };
 
-  return fetchImdbId(tmdbId, type).then(function(imdbId) {
-    log("IMDb ID: " + imdbId);
-    ctx.displayTitle = "IMDb " + imdbId;
-    return fetchVaplayer(ctx, type, season, episode);
-  }).catch(function(err) {
-    log("Error: " + (err && err.message));
-    return [];
-  });
+  // TMDB is optional – it only updates the display title.
+  // If it fails (rate-limit, key issue), we still proceed to vaplayer.
+  return fetchImdbId(tmdbId, type)
+    .then(function(imdbId) {
+      log("IMDb ID: " + imdbId);
+      ctx.displayTitle = "IMDb " + imdbId;
+    })
+    .catch(function(err) {
+      log("TMDB skipped, continuing: " + (err && err.message));
+    })
+    .then(function() {
+      return fetchVaplayer(ctx, type, season, episode);
+    })
+    .catch(function(err) {
+      log("Error: " + (err && err.message));
+      return [];
+    });
 }
 
 // ---------------------------------------------------------------- entry point
@@ -258,4 +271,4 @@ if (typeof module !== "undefined" && module.exports) {
   module.exports = { getStreams: getStreams };
 } else {
   global.getStreams = getStreams;
-}
+    }
