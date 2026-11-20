@@ -1,12 +1,10 @@
 var PROVIDER_ID = "nebula";
 var PROVIDER_NAME = "Nebula";
 
-var VAPLAYER_API = "https://streamdata.vaplayer.ru/api.php";
-var PLAYER_ORIGIN = "https://nextgencloudfabric.com"; // required origin
-
-var UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+var STREAM_API = "https://streamdata.vaplayer.ru/api.php";
+var PLAYER_ORIGIN = "https://nextgencloudfabric.com";
+var USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 var TMDB_API_KEY = "83d364331c40bfbe29858aeed82f45cc";
-
 var FETCH_TIMEOUT_MS = 12000;
 
 function log(m) { console.log("[" + PROVIDER_NAME + "] " + m); }
@@ -19,11 +17,8 @@ function withTimeout(promise, ms, label) {
     var t = setTimeout(function() {
       if (!done) { done = true; reject(new Error((label || "request") + " timeout")); }
     }, ms);
-    promise.then(function(v) {
-      if (!done) { done = true; clearTimeout(t); resolve(v); }
-    }, function(e) {
-      if (!done) { done = true; clearTimeout(t); reject(e); }
-    });
+    promise.then(function(v) { if (!done) { done = true; clearTimeout(t); resolve(v); } },
+                 function(e) { if (!done) { done = true; clearTimeout(t); reject(e); } });
   });
 }
 
@@ -40,23 +35,12 @@ function request(url, headers, timeoutMs) {
 }
 
 // ---------------------------------------------------------------- helpers
-function pad2(n) { return n < 10 ? "0" + n : String(n); }
-
 function labelFromRes(w, h) {
   if (w >= 3200 || h >= 2000) return "4K";
   if (w >= 1800 || h >= 1000) return "1080p";
   if (w >= 1200 || h >= 700) return "720p";
   if (w >= 800 || h >= 460) return "480p";
   if (h > 0) return h + "p";
-  return "Auto";
-}
-
-function labelFromName(name) {
-  var n = String(name || "").toLowerCase();
-  if (n.indexOf("2160p") !== -1 || n.indexOf("4k") !== -1) return "4K";
-  if (n.indexOf("1080p") !== -1) return "1080p";
-  if (n.indexOf("720p") !== -1) return "720p";
-  if (n.indexOf("480p") !== -1) return "480p";
   return "Auto";
 }
 
@@ -82,20 +66,22 @@ function absUrl(base, rel) {
   return origin + parts.join("/");
 }
 
-// ---------------------------------------------------------------- TMDB (optional, only for display title)
-function fetchImdbId(tmdbId, type) {
+// ---------------------------------------------------------------- TMDB → IMDb (required by the stream API)
+function resolveImdbId(tmdbId, type) {
   var url = "https://api.themoviedb.org/3/" + type + "/" + encodeURIComponent(tmdbId) +
     "?api_key=" + TMDB_API_KEY + "&language=en&append_to_response=external_ids";
   return request(url, { "Accept": "application/json" }).then(function(r) {
     if (!r.ok) throw new Error("TMDB HTTP " + r.status);
     var d = JSON.parse(r.text);
     var imdbId = (d.external_ids && d.external_ids.imdb_id) || d.imdb_id || "";
-    if (!imdbId) throw new Error("No IMDb ID found for TMDB " + tmdbId);
+    if (!imdbId || imdbId.indexOf("tt") !== 0) {
+      throw new Error("No valid IMDb ID for TMDB " + tmdbId);
+    }
     return imdbId;
   });
 }
 
-// ---------------------------------------------------------------- HLS Parser
+// ---------------------------------------------------------------- HLS parser (for quality variants)
 function parseMaster(masterUrl, text) {
   var lines = text.split(/\r?\n/);
   var byKey = {};
@@ -145,63 +131,91 @@ function makeStream(ctx, url, label, rank, headers) {
   };
 }
 
-// ---------------------------------------------------------------- vaplayer API
-function fetchVaplayer(ctx, type, season, episode, imdbId) {
-  // CRITICAL FIX: use imdb=, not tmdb=
-  var params = "imdb=" + encodeURIComponent(imdbId) + "&type=" + type;
-  if (type === "tv") params += "&season=" + season + "&episode=" + episode;
-  var url = VAPLAYER_API + "?" + params;
+// ---------------------------------------------------------------- vaplayer stream API
+function fetchStreamUrls(imdbId, type, season, episode) {
+  var params = new URLSearchParams({ imdb: imdbId, type: type });
+  if (type === "tv" && season != null && episode != null) {
+    params.set("season", String(season));
+    params.set("episode", String(episode));
+  }
+  var url = STREAM_API + "?" + params.toString();
 
-  // CRITICAL FIX: Origin and Referer must be nextgencloudfabric.com
   var referer = type === "tv"
     ? PLAYER_ORIGIN + "/embed/tv/" + imdbId + "/" + season + "/" + episode
     : PLAYER_ORIGIN + "/embed/movie/" + imdbId;
 
   var headers = {
-    "Origin": PLAYER_ORIGIN,
+    "User-Agent": USER_AGENT,
     "Referer": referer,
-    "User-Agent": UA
+    "Origin": PLAYER_ORIGIN
   };
 
-  log("Vortex API: " + url);
+  log("Stream API: " + url);
 
   return request(url, headers).then(function(r) {
-    log("HTTP " + r.status + " body[0..300]=" + JSON.stringify(r.text.slice(0, 300)));
+    if (!r.ok) throw new Error("VaPlayer API HTTP " + r.status);
+    var json = JSON.parse(r.text);
+    if (json.status_code !== "200" && json.status_code !== 200) {
+      throw new Error("VaPlayer API error: " + (json.error || "status_code=" + json.status_code));
+    }
+    return (json.data && json.data.stream_urls) || [];
+  });
+}
 
-    var data = null;
-    try { data = JSON.parse(r.text); } catch (e) { log("JSON parse failed: " + e.message); return []; }
-    if (!r.ok) { log("HTTP error " + r.status); return []; }
-
-    // status_code may be returned as string "200" or number 200
-    if (data.status_code !== 200 && data.status_code !== "200") {
-      log("vaplayer status_code=" + data.status_code + " error=" + (data.error || ""));
+// ---------------------------------------------------------------- stream assembly
+function buildStreams(ctx, imdbId, type, season, episode) {
+  return fetchStreamUrls(imdbId, type, season, episode).then(function(streamUrls) {
+    if (!streamUrls.length) {
+      log("No stream URLs returned");
       return [];
     }
-    if (!data.data || !Array.isArray(data.data.stream_urls)) {
-      log("Unexpected schema; keys=" + Object.keys(data || {}).join(",") +
-          (data.data ? " dataKeys=" + Object.keys(data.data).join(",") : ""));
-      return [];
-    }
 
-    // Expand each stream URL to get its quality variants
-    var expandPromises = data.data.stream_urls.map(function(u) {
+    var expandPromises = streamUrls.map(function(u) {
       if (typeof u !== "string" || !/^https?:\/\//i.test(u)) return Promise.resolve([]);
-      return request(u, headers).then(function(r) {
+
+      return request(u, {
+        "User-Agent": USER_AGENT,
+        "Referer": PLAYER_ORIGIN + "/",
+        "Origin": PLAYER_ORIGIN
+      }).then(function(r) {
         if (!r.ok || r.text.indexOf("#EXTM3U") === -1) {
-          return [makeStream(ctx, u, "Auto", 1000000, headers)];
+          return [makeStream(ctx, u, "Auto", 1000000, {
+            "User-Agent": USER_AGENT,
+            "Referer": PLAYER_ORIGIN + "/",
+            "Origin": PLAYER_ORIGIN
+          })];
         }
+
         var master = parseMaster(u, r.text);
         var top = labelFromRes(master.best.w, master.best.h);
+
         if (master.variants.length < 2 || master.hasSeparateAudio) {
-          return [makeStream(ctx, u, top, 1000000, headers)];
+          return [makeStream(ctx, u, top, 1000000, {
+            "User-Agent": USER_AGENT,
+            "Referer": PLAYER_ORIGIN + "/",
+            "Origin": PLAYER_ORIGIN
+          })];
         }
-        var out = [makeStream(ctx, u, "Auto", 1000000, headers)];
+
+        var out = [makeStream(ctx, u, "Auto", 1000000, {
+          "User-Agent": USER_AGENT,
+          "Referer": PLAYER_ORIGIN + "/",
+          "Origin": PLAYER_ORIGIN
+        })];
         master.variants.forEach(function(v) {
-          out.push(makeStream(ctx, v.url, v.label, rankOf(v.label), headers));
+          out.push(makeStream(ctx, v.url, v.label, rankOf(v.label), {
+            "User-Agent": USER_AGENT,
+            "Referer": PLAYER_ORIGIN + "/",
+            "Origin": PLAYER_ORIGIN
+          }));
         });
         return out;
       }).catch(function() {
-        return [makeStream(ctx, u, "Auto", 1000000, headers)];
+        return [makeStream(ctx, u, "Auto", 1000000, {
+          "User-Agent": USER_AGENT,
+          "Referer": PLAYER_ORIGIN + "/",
+          "Origin": PLAYER_ORIGIN
+        })];
       });
     });
 
@@ -209,9 +223,8 @@ function fetchVaplayer(ctx, type, season, episode, imdbId) {
       var byQuality = {};
       groups.forEach(function(g) {
         g.forEach(function(s) {
-          var q = s.quality;
-          if (!byQuality[q] || s._rank > byQuality[q]._rank) {
-            byQuality[q] = s;
+          if (!byQuality[s.quality] || s._rank > byQuality[s.quality]._rank) {
+            byQuality[s.quality] = s;
           }
         });
       });
@@ -228,21 +241,24 @@ function fetchVaplayer(ctx, type, season, episode, imdbId) {
 function getStreamsFor(tmdbId, type, season, episode) {
   var ctx = {
     tmdbId: tmdbId,
-    displayTitle: type === "movie" ? "TMDB " + tmdbId : "TMDB " + tmdbId + " S" + pad2(season) + "E" + pad2(episode)
+    displayTitle: type === "movie"
+      ? "TMDB " + tmdbId
+      : "TMDB " + tmdbId + " S" + pad2(season) + "E" + pad2(episode)
   };
 
-  // Resolve IMDb first – it is REQUIRED for the API call, not just for the title.
-  return fetchImdbId(tmdbId, type)
+  return resolveImdbId(tmdbId, type)
     .then(function(imdbId) {
       log("IMDb ID: " + imdbId);
       ctx.displayTitle = "IMDb " + imdbId;
-      return fetchVaplayer(ctx, type, season, episode, imdbId);
+      return buildStreams(ctx, imdbId, type, season, episode);
     })
     .catch(function(err) {
       log("Error: " + (err && err.message));
       return [];
     });
 }
+
+function pad2(n) { return n < 10 ? "0" + n : String(n); }
 
 // ---------------------------------------------------------------- entry point
 function getStreams(tmdbId, mediaType, seasonNum, episodeNum) {
@@ -262,4 +278,4 @@ if (typeof module !== "undefined" && module.exports) {
   module.exports = { getStreams: getStreams };
 } else {
   global.getStreams = getStreams;
-                           }
+            }
